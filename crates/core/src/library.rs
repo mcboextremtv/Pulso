@@ -310,11 +310,19 @@ mod tests {
     #[test]
     fn folder_tree_and_filter() {
         let lib = Library::open_in_memory().unwrap();
+        // Rutas con el separador propio de cada sistema (en Windows, "\\").
+        let native = |s: &str| {
+            s.split('/')
+                .filter(|x| !x.is_empty())
+                .fold(PathBuf::from(std::path::MAIN_SEPARATOR_STR), |acc, x| acc.join(x))
+                .to_string_lossy()
+                .into_owned()
+        };
         for (i, p) in ["/m/rock/a/1.mp3", "/m/rock/b/2.mp3", "/m/pop/3.mp3"].iter().enumerate() {
             lib.conn
                 .execute(
                     "INSERT INTO tracks (path,title,artist,album,duration_ms,mtime) VALUES (?1,?2,'','',1000,0)",
-                    params![p, format!("t{i}")],
+                    params![native(p), format!("t{i}")],
                 )
                 .unwrap();
         }
