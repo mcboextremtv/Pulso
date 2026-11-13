@@ -1,0 +1,19 @@
+[package]
+name = "pulso"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[dependencies]
+pulso-core = { path = "../core" }
+# Renderizador por software: no exige GPU ni drivers, ideal para equipos viejos.
+slint = { version = "1", default-features = false, features = [
+    "std", "compat-1-2", "backend-winit", "renderer-software", "software-renderer-systemfonts",
+] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.15", default-features = false }
+
+[build-dependencies]
+slint-build = "1"
