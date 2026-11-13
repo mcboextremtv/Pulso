@@ -7,9 +7,10 @@ build = "build.rs"
 
 [dependencies]
 pulso-core = { path = "../core" }
-# Renderizador por software: no exige GPU ni drivers, ideal para equipos viejos.
+# Dos modos de dibujo: femtovg (GPU/OpenGL) y software (sin GPU). Se elige con PULSO_RENDERER.
 slint = { version = "1", default-features = false, features = [
-    "std", "compat-1-2", "backend-winit", "renderer-software", "software-renderer-systemfonts",
+    "std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software",
+    "software-renderer-systemfonts",
 ] }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]

@@ -6,9 +6,10 @@ license = "GPL-3.0-or-later"
 description = "Motor de audio, biblioteca y letras de Pulso (sin dependencias de interfaz)"
 
 [dependencies]
-rodio = { version = "0.19", default-features = false, features = [
-    "symphonia-mp3", "symphonia-flac", "symphonia-vorbis",
-    "symphonia-aac", "symphonia-isomp4", "symphonia-wav",
+rodio = { version = "0.21", default-features = false, features = [
+    "playback",
+    "symphonia-mp3", "symphonia-flac", "symphonia-vorbis", "symphonia-ogg",
+    "symphonia-aac", "symphonia-isomp4", "symphonia-alac", "symphonia-wav", "symphonia-pcm",
 ] }
 lofty = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }

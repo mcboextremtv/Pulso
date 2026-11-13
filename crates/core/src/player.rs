@@ -1,12 +1,16 @@
 //! Motor de audio. Corre en su propio hilo: la interfaz nunca lo bloquea.
 //! La salida de audio se abre en la primera reproducción (arranque instantáneo).
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{
+    cpal::BufferSize, source::SeekError, ChannelCount, Decoder, OutputStream, OutputStreamBuilder, SampleRate,
+    Sink, Source,
+};
 use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
     sync::{
-        mpsc::{self, RecvTimeoutError},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
+        mpsc::{self, RecvTimeoutError, TryRecvError, TrySendError},
         Arc, Mutex,
     },
     thread,
@@ -28,6 +32,8 @@ pub struct Status {
     pub duration: Option<Duration>,
     pub finished: bool,
     pub error: Option<String>,
+    /// Veces que el audio se quedó sin datos (cortes por falta de decodificación a tiempo).
+    pub underruns: u64,
 }
 
 enum Cmd {
@@ -96,28 +102,238 @@ impl Drop for Player {
     }
 }
 
-type Out = Option<(OutputStream, OutputStreamHandle)>;
+// ---------------------------------------------------------------------------
+// Decodificación anticipada
+//
+// Un hilo aparte decodifica el archivo y llena una cola de ~2 s. El hilo urgente
+// de la tarjeta de sonido solo copia de esa cola: un tirón de CPU (antivirus,
+// ratón, memoria justa) queda absorbido por el colchón y no se oye.
+// ---------------------------------------------------------------------------
 
-fn start(path: &Path, out: &mut Out, volume: f32) -> Result<(Sink, Option<Duration>), String> {
-    if out.is_none() {
-        *out = Some(
-            OutputStream::try_default().map_err(|e| format!("Sin dispositivo de audio: {e}"))?,
-        );
+const CHUNK: usize = 8192; // muestras por bloque
+const BUFFER_SECS: usize = 2;
+const PREFILL_CHUNKS: usize = 4;
+
+struct Chunk {
+    gen: u64,
+    data: Vec<f32>,
+}
+
+enum DecCmd {
+    Seek(Duration),
+}
+
+struct BufferedSource {
+    rx: mpsc::Receiver<Chunk>,
+    cmd: mpsc::Sender<DecCmd>,
+    gen: Arc<AtomicU64>,
+    queued: Arc<AtomicUsize>,
+    underruns: Arc<AtomicU64>,
+    buf: Vec<f32>,
+    pos: usize,
+    channels: ChannelCount,
+    rate: SampleRate,
+    total: Option<Duration>,
+    starving: bool,
+}
+
+impl Iterator for BufferedSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        loop {
+            if self.pos < self.buf.len() {
+                let s = self.buf[self.pos];
+                self.pos += 1;
+                self.starving = false;
+                return Some(s);
+            }
+            match self.rx.try_recv() {
+                Ok(c) => {
+                    self.queued.fetch_sub(1, Relaxed);
+                    if c.gen == self.gen.load(Relaxed) {
+                        self.buf = c.data;
+                        self.pos = 0;
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    // El decodificador no llegó a tiempo: silencio breve, sin bloquear.
+                    if !self.starving {
+                        self.starving = true;
+                        self.underruns.fetch_add(1, Relaxed);
+                    }
+                    return Some(0.0);
+                }
+                Err(TryRecvError::Disconnected) => return None,
+            }
+        }
     }
-    let handle = &out.as_ref().unwrap().1;
+}
+
+impl Source for BufferedSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+    fn sample_rate(&self) -> SampleRate {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.total
+    }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        self.gen.fetch_add(1, Relaxed); // invalida lo ya decodificado
+        self.buf.clear();
+        self.pos = 0;
+        self.cmd.send(DecCmd::Seek(pos)).map_err(|_| SeekError::NotSupported {
+            underlying_source: "hilo de decodificación",
+        })
+    }
+}
+
+fn decode_loop(
+    mut dec: Decoder<BufReader<File>>,
+    tx: mpsc::SyncSender<Chunk>,
+    cmd: mpsc::Receiver<DecCmd>,
+    gen: Arc<AtomicU64>,
+    queued: Arc<AtomicUsize>,
+    finished: Arc<AtomicBool>,
+) {
+    let mut my_gen = gen.load(Relaxed);
+    'outer: loop {
+        loop {
+            match cmd.try_recv() {
+                Ok(DecCmd::Seek(p)) => {
+                    let _ = dec.try_seek(p);
+                    my_gen = gen.load(Relaxed);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break 'outer,
+            }
+        }
+        let data: Vec<f32> = dec.by_ref().take(CHUNK).collect();
+        if data.is_empty() {
+            break;
+        }
+        let mut pending = Some(Chunk { gen: my_gen, data });
+        while let Some(ch) = pending.take() {
+            queued.fetch_add(1, Relaxed);
+            match tx.try_send(ch) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => break 'outer,
+                Err(TrySendError::Full(ch)) => {
+                    queued.fetch_sub(1, Relaxed);
+                    // Cola llena: esperar un hueco, atendiendo saltos de posición.
+                    match cmd.recv_timeout(Duration::from_millis(10)) {
+                        Ok(DecCmd::Seek(p)) => {
+                            let _ = dec.try_seek(p);
+                            my_gen = gen.load(Relaxed);
+                        }
+                        Err(RecvTimeoutError::Timeout) => pending = Some(ch),
+                        Err(RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
+            }
+        }
+    }
+    finished.store(true, Relaxed);
+}
+
+fn buffer_frames() -> BufferSize {
+    // PULSO_AUDIO_BUFFER=<frames> para probar; 0 = el de Windows por defecto.
+    let n = std::env::var("PULSO_AUDIO_BUFFER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4096);
+    if n == 0 {
+        BufferSize::Default
+    } else {
+        BufferSize::Fixed(n)
+    }
+}
+
+struct Open {
+    stream: OutputStream,
+}
+
+type Out = Option<Open>;
+
+fn open_output() -> Result<Open, String> {
+    let builder = OutputStreamBuilder::from_default_device()
+        .map_err(|e| format!("Sin dispositivo de audio: {e}"))?
+        .with_buffer_size(buffer_frames());
+    let mut stream = builder
+        .open_stream_or_fallback()
+        .map_err(|e| format!("No se pudo abrir el audio: {e}"))?;
+    stream.log_on_drop(false);
+    Ok(Open { stream })
+}
+
+struct Started {
+    sink: Sink,
+    duration: Option<Duration>,
+    underruns: Arc<AtomicU64>,
+}
+
+fn start(path: &Path, out: &mut Out, volume: f32) -> Result<Started, String> {
+    if out.is_none() {
+        *out = Some(open_output()?);
+    }
     let file = File::open(path).map_err(|e| format!("No se pudo abrir el archivo: {e}"))?;
-    let decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| format!("Formato no compatible: {e}"))?;
-    let duration = decoder.total_duration();
-    let sink = Sink::try_new(handle).map_err(|e| format!("Error de audio: {e}"))?;
+    let dec = Decoder::try_from(file).map_err(|e| format!("Formato no compatible: {e}"))?;
+    let (channels, rate, total) = (dec.channels(), dec.sample_rate(), dec.total_duration());
+
+    let per_sec = (rate as usize * channels as usize).max(1);
+    let capacity = (per_sec * BUFFER_SECS / CHUNK).max(PREFILL_CHUNKS * 2);
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let gen = Arc::new(AtomicU64::new(0));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let underruns = Arc::new(AtomicU64::new(0));
+
+    {
+        let (gen, queued, finished) = (gen.clone(), queued.clone(), finished.clone());
+        thread::Builder::new()
+            .name("pulso-decode".into())
+            .spawn(move || decode_loop(dec, tx, cmd_rx, gen, queued, finished))
+            .map_err(|e| format!("No se pudo crear el hilo de decodificación: {e}"))?;
+    }
+
+    // Llenado previo: unos 0,4 s antes de que empiece a sonar (tarda pocos ms).
+    let t0 = std::time::Instant::now();
+    while queued.load(Relaxed) < PREFILL_CHUNKS
+        && !finished.load(Relaxed)
+        && t0.elapsed() < Duration::from_millis(500)
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let source = BufferedSource {
+        rx,
+        cmd: cmd_tx,
+        gen,
+        queued,
+        underruns: underruns.clone(),
+        buf: Vec::new(),
+        pos: 0,
+        channels,
+        rate,
+        total,
+        starving: false,
+    };
+    let sink = Sink::connect_new(out.as_ref().unwrap().stream.mixer());
     sink.set_volume(volume);
-    sink.append(decoder);
-    Ok((sink, duration))
+    sink.append(source);
+    Ok(Started { sink, duration: total, underruns })
 }
 
 fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
     let mut out: Out = None;
     let mut sink: Option<Sink> = None;
+    let mut underruns: Option<Arc<AtomicU64>> = None;
     let mut volume = 1.0_f32;
 
     loop {
@@ -125,13 +341,16 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Cmd::Play(path)) => {
                 sink = None; // detiene la anterior
+                underruns = None;
+                let result = start(&path, &mut out, volume);
                 let mut g = st.lock().unwrap();
-                match start(&path, &mut out, volume) {
-                    Ok((s, dur)) => {
-                        sink = Some(s);
+                match result {
+                    Ok(s) => {
+                        sink = Some(s.sink);
+                        underruns = Some(s.underruns);
                         *g = Status {
                             state: PlayState::Playing,
-                            duration: dur,
+                            duration: s.duration,
                             ..Status::default()
                         };
                     }
@@ -163,6 +382,7 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
             }
             Ok(Cmd::Stop) => {
                 sink = None;
+                underruns = None;
                 *st.lock().unwrap() = Status::default();
             }
             Ok(Cmd::Volume(v)) => {
@@ -182,6 +402,9 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
         if let Some(s) = &sink {
             let mut g = st.lock().unwrap();
             g.position = s.get_pos();
+            if let Some(u) = &underruns {
+                g.underruns = u.load(Relaxed);
+            }
             if g.state == PlayState::Playing && s.empty() {
                 g.state = PlayState::Stopped;
                 g.finished = true;

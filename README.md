@@ -6,6 +6,12 @@ Reproductor de música libre, rápido y liviano. Sin telemetría, sin publicidad
 - **Interfaz en Slint** (`crates/app`) con renderizador por software: no necesita GPU, drivers ni runtimes externos. Un solo `.exe`.
 - El audio abre el dispositivo solo al reproducir y corre en su propio hilo. La red solo se usa al pedir una letra.
 
+## Hito 1.1: estabilidad del audio y del dibujo
+- **Audio sin cortes:** un hilo aparte decodifica por adelantado y mantiene ~2 s de colchón; la tarjeta de sonido solo copia de ahí. El búfer de salida es de 4096 tramas (antes, el mínimo de Windows). Se prueba con `PULSO_AUDIO_BUFFER=<tramas>` (0 = el de Windows, 8192 = más margen).
+- **Contador de cortes:** con `PULSO_BENCH=1` la consola imprime `cortes de audio acumulados: N` cuando el decodificador no llega a tiempo.
+- **Dos modos de dibujo:** `PULSO_RENDERER=femtovg` (GPU, por defecto, con relanzamiento automático a software si la ventana no se puede crear) o `PULSO_RENDERER=software` (sin GPU).
+- Corregido: faltaban los códecs de `.wav` y `.ogg` (los MP3 funcionaban).
+
 ## Estado (hito 1)
 Hecho: escanear carpetas, buscar, reproducir, pausa/anterior/siguiente, volumen, búsqueda en la barra de progreso (clic), letra sincronizada (se guarda como `.lrc` junto a la canción), paso automático a la siguiente pista.
 Pendiente: MusicBrainz/AcoustID (completar etiquetas y carátulas), arrastrar en la barra de progreso, cola y listas, ecualizador, controles multimedia del sistema.

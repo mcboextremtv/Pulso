@@ -24,6 +24,7 @@ struct State {
     synced: Vec<(Duration, String)>,
     /// -2 = hay que redibujar, -1 = antes de la primera línea, n = línea activa
     last_lyric: i64,
+    last_underruns: u64,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -216,9 +217,29 @@ fn pick_folder() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Music")))
 }
 
+/// PULSO_RENDERER=femtovg (GPU, por defecto) o software. Si la ventana no se puede crear
+/// con la GPU, se relanza solo en modo software.
 fn main() {
     let t0 = Instant::now();
-    let ui = MainWindow::new().expect("no se pudo crear la ventana");
+    let forced = std::env::var("PULSO_RENDERER").ok();
+    let renderer = forced.clone().unwrap_or_else(|| "femtovg".into());
+    let _ = slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name(renderer.clone())
+        .select();
+    let ui = match MainWindow::new() {
+        Ok(ui) => ui,
+        Err(e) => {
+            if forced.is_none() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).env("PULSO_RENDERER", "software").spawn();
+                    return;
+                }
+            }
+            panic!("no se pudo crear la ventana: {e}");
+        }
+    };
+    let bench = std::env::var_os("PULSO_BENCH").is_some();
     let player: PlayerRef = Arc::new(Player::new());
     let st: Shared = Arc::new(Mutex::new(State { last_lyric: -2, ..Default::default() }));
 
@@ -314,6 +335,10 @@ fn main() {
                 if let Some(e) = &s.error {
                     ui.set_status_text(e.clone().into());
                 }
+                if bench && s.underruns != g.last_underruns {
+                    g.last_underruns = s.underruns;
+                    eprintln!("[bench] cortes de audio acumulados: {}", s.underruns);
+                }
                 if g.current.is_some() {
                     ui.set_playing(s.state == PlayState::Playing);
                     let dur = s.duration.or(g.current_dur).unwrap_or_default();
@@ -340,9 +365,9 @@ fn main() {
 
     refresh_view(ui.as_weak(), st.clone());
 
-    if std::env::var_os("PULSO_BENCH").is_some() {
+    if bench {
         slint::Timer::single_shot(Duration::from_millis(0), move || {
-            eprintln!("[bench] ventana lista en {:?}", t0.elapsed());
+            eprintln!("[bench] ventana lista en {:?} (dibujo: {renderer})", t0.elapsed());
         });
     }
     ui.run().expect("error en la interfaz");
