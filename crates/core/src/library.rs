@@ -3,7 +3,8 @@ use crate::Result;
 use lofty::{prelude::*, probe::Probe};
 use rusqlite::{params, Connection};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -46,6 +47,16 @@ pub fn read_tags(path: &Path) -> Result<Track> {
         album: tag.and_then(|t| get(t.album())).unwrap_or_default(),
         duration_ms: tagged.properties().duration().as_millis() as u64,
     })
+}
+
+/// Carpeta de la vista en árbol (aplanada, con sangría por `depth`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderNode {
+    pub path: String,
+    pub name: String,
+    pub depth: usize,
+    /// Canciones dentro de esta carpeta, incluidas sus subcarpetas.
+    pub count: usize,
 }
 
 pub struct Library {
@@ -138,14 +149,21 @@ impl Library {
 
     /// Busca en título, artista y álbum. Cadena vacía = toda la biblioteca.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>> {
+        self.search_in(query, "", limit)
+    }
+
+    /// Igual que `search`, limitado a una carpeta (y sus subcarpetas).
+    /// `folder_prefix` debe terminar en el separador de rutas; vacío = sin límite.
+    pub fn search_in(&self, query: &str, folder_prefix: &str, limit: usize) -> Result<Vec<Track>> {
         let like = format!("%{}%", query.trim());
         let mut stmt = self.conn.prepare(
             "SELECT id, path, title, artist, album, duration_ms FROM tracks
-             WHERE title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1
-             ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE
+             WHERE (title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1)
+               AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+             ORDER BY path COLLATE NOCASE
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![like, limit as i64], |r| {
+        let rows = stmt.query_map(params![like, limit as i64, folder_prefix], |r| {
             Ok(Track {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -156,6 +174,56 @@ impl Library {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Árbol de carpetas de la biblioteca, aplanado y ordenado. Empieza debajo de la
+    /// carpeta común a todas las canciones (no se muestran niveles vacíos de arriba).
+    pub fn folder_tree(&self) -> Result<Vec<FolderNode>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM tracks")?;
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+
+        let mut direct: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        for p in &paths {
+            if let Some(dir) = Path::new(p).parent() {
+                *direct.entry(dir.to_path_buf()).or_default() += 1;
+            }
+        }
+        let comps: Vec<Vec<OsString>> = direct
+            .keys()
+            .map(|d| d.components().map(|c| c.as_os_str().to_owned()).collect())
+            .collect();
+        let Some(first) = comps.first() else { return Ok(vec![]) };
+        let mut common = first.clone();
+        for c in &comps[1..] {
+            let n = common.iter().zip(c).take_while(|(a, b)| a == b).count();
+            common.truncate(n);
+        }
+        let base = common.len();
+
+        let mut counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        for (dir, n) in &direct {
+            for anc in dir.ancestors() {
+                if anc.components().count() <= base {
+                    break;
+                }
+                *counts.entry(anc.to_path_buf()).or_default() += n;
+            }
+        }
+        let mut nodes: Vec<(Vec<String>, FolderNode)> = counts
+            .into_iter()
+            .map(|(p, count)| {
+                let key: Vec<String> =
+                    p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                let depth = key.len() - base - 1;
+                (key, FolderNode { path: p.to_string_lossy().into_owned(), name, depth, count })
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(nodes.into_iter().map(|(_, n)| n).collect())
     }
 
     pub fn count(&self) -> Result<usize> {
@@ -237,5 +305,27 @@ mod tests {
         assert_eq!(s3.removed, 1);
         assert_eq!(lib.count().unwrap(), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_tree_and_filter() {
+        let lib = Library::open_in_memory().unwrap();
+        for (i, p) in ["/m/rock/a/1.mp3", "/m/rock/b/2.mp3", "/m/pop/3.mp3"].iter().enumerate() {
+            lib.conn
+                .execute(
+                    "INSERT INTO tracks (path,title,artist,album,duration_ms,mtime) VALUES (?1,?2,'','',1000,0)",
+                    params![p, format!("t{i}")],
+                )
+                .unwrap();
+        }
+        let tree = lib.folder_tree().unwrap();
+        let view: Vec<(&str, usize, usize)> = tree.iter().map(|n| (n.name.as_str(), n.depth, n.count)).collect();
+        assert_eq!(view, vec![("pop", 0, 1), ("rock", 0, 2), ("a", 1, 1), ("b", 1, 1)]);
+
+        let sep = std::path::MAIN_SEPARATOR;
+        let rock = tree.iter().find(|n| n.name == "rock").unwrap();
+        let under_rock = lib.search_in("", &format!("{}{sep}", rock.path), 100).unwrap();
+        assert_eq!(under_rock.len(), 2);
+        assert_eq!(lib.search_in("t2", "", 100).unwrap().len(), 1);
     }
 }

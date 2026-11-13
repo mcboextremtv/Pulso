@@ -1,12 +1,15 @@
-//! Letras desde LRCLIB (https://lrclib.net): API abierta, con letras sincronizadas (.lrc).
+//! Letras: LRCLIB (https://lrclib.net, API abierta con letras sincronizadas),
+//! archivos locales editables por el usuario y búsqueda en el navegador.
 use crate::Result;
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const UA: &str = "Pulso/0.1 (reproductor de musica libre)";
+const GET_URL: &str = "https://lrclib.net/api/get";
+const SEARCH_URL: &str = "https://lrclib.net/api/search";
 
 #[derive(Debug, Default, Clone)]
 pub struct Lyrics {
@@ -19,6 +22,13 @@ impl Lyrics {
     pub fn synced_lines(&self) -> Vec<(Duration, String)> {
         self.synced_raw.as_deref().map(parse_lrc).unwrap_or_default()
     }
+    fn has_content(&self) -> bool {
+        self.synced_raw.is_some() || self.plain.is_some() || self.instrumental
+    }
+    /// Texto para guardar o editar: sincronizada si existe, si no la plana.
+    pub fn best_text(&self) -> Option<String> {
+        self.synced_raw.clone().or_else(|| self.plain.clone())
+    }
 }
 
 fn from_json(v: &serde_json::Value) -> Lyrics {
@@ -30,47 +40,169 @@ fn from_json(v: &serde_json::Value) -> Lyrics {
     }
 }
 
-/// Busca la letra. `Ok(None)` = LRCLIB no la tiene. Solo hace red cuando se llama.
+/// De una lista de resultados, prefiere la que trae letra sincronizada.
+fn best(v: &serde_json::Value) -> Option<Lyrics> {
+    let items: Vec<Lyrics> = v.as_array()?.iter().map(from_json).filter(Lyrics::has_content).collect();
+    items
+        .iter()
+        .find(|l| l.synced_raw.is_some())
+        .or_else(|| items.iter().find(|l| l.plain.is_some()))
+        .or_else(|| items.first())
+        .cloned()
+}
+
+/// GET con parámetros (los vacíos se omiten). `Ok(None)` = sin datos (400/404);
+/// `Err` = problema de red o del servidor, con un mensaje legible.
+fn get_json(agent: &ureq::Agent, url: &str, params: &[(&str, &str)]) -> Result<Option<serde_json::Value>> {
+    let mut req = agent.get(url);
+    for (k, v) in params {
+        if !v.is_empty() {
+            req = req.query(k, v);
+        }
+    }
+    match req.call() {
+        Ok(r) => Ok(Some(serde_json::from_str(&r.into_string()?)?)),
+        Err(ureq::Error::Status(400 | 404, _)) => Ok(None),
+        Err(ureq::Error::Status(code, _)) => {
+            Err(format!("el servicio de letras respondió con el error {code}").into())
+        }
+        Err(ureq::Error::Transport(t)) => {
+            Err(format!("no se pudo conectar con el servicio de letras ({t})").into())
+        }
+    }
+}
+
+/// Busca la letra en LRCLIB. `Ok(None)` = no la tiene. Solo hace red cuando se llama.
+/// Orden: coincidencia exacta → búsqueda por campos → búsqueda libre.
 pub fn fetch(artist: &str, title: &str, album: &str, duration_secs: Option<u64>) -> Result<Option<Lyrics>> {
+    let (artist, title) = (artist.trim(), title.trim());
+    if title.is_empty() {
+        return Ok(None);
+    }
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(8))
         .user_agent(UA)
         .build();
 
-    let mut req = agent
-        .get("https://lrclib.net/api/get")
-        .query("track_name", title)
-        .query("artist_name", artist);
-    if !album.is_empty() {
-        req = req.query("album_name", album);
-    }
-    if let Some(d) = duration_secs.filter(|d| *d > 0) {
-        req = req.query("duration", &d.to_string());
-    }
-    match req.call() {
-        Ok(r) => return Ok(Some(from_json(&serde_json::from_str(&r.into_string()?)?))),
-        Err(ureq::Error::Status(404, _)) => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    // Respaldo: búsqueda aproximada.
-    let r = agent
-        .get("https://lrclib.net/api/search")
-        .query("track_name", title)
-        .query("artist_name", artist)
-        .call();
-    match r {
-        Ok(r) => {
-            let v: serde_json::Value = serde_json::from_str(&r.into_string()?)?;
-            let best = v
-                .as_array()
-                .and_then(|a| a.iter().find(|x| x["syncedLyrics"].is_string()).or_else(|| a.first()));
-            Ok(best.map(from_json))
+    if !artist.is_empty() {
+        let dur = duration_secs.filter(|d| *d > 0).map(|d| d.to_string()).unwrap_or_default();
+        let params = [("track_name", title), ("artist_name", artist), ("album_name", album), ("duration", dur.as_str())];
+        if let Some(v) = get_json(&agent, GET_URL, &params)? {
+            let l = from_json(&v);
+            if l.has_content() {
+                return Ok(Some(l));
+            }
         }
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(e) => Err(e.into()),
+    }
+    if let Some(v) = get_json(&agent, SEARCH_URL, &[("track_name", title), ("artist_name", artist)])? {
+        if let Some(l) = best(&v) {
+            return Ok(Some(l));
+        }
+    }
+    let q = format!("{artist} {title}");
+    if let Some(v) = get_json(&agent, SEARCH_URL, &[("q", q.trim())])? {
+        if let Some(l) = best(&v) {
+            return Ok(Some(l));
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Letras locales (el usuario manda: puede pegar, corregir o borrar)
+//   cancion.lrc          → sincronizada
+//   cancion.lyrics.txt   → sin sincronizar
+// ---------------------------------------------------------------------------
+
+pub fn sidecar_path(track: &Path) -> PathBuf {
+    track.with_extension("lrc")
+}
+
+fn plain_path(track: &Path) -> PathBuf {
+    let mut name = track.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
+    name.push(".lyrics.txt");
+    track.with_file_name(name)
+}
+
+fn read_nonempty(p: &Path) -> Option<String> {
+    fs::read_to_string(p).ok().filter(|s| !s.trim().is_empty())
+}
+
+pub fn load_sidecar(track: &Path) -> Option<String> {
+    read_nonempty(&sidecar_path(track))
+}
+
+pub fn save_sidecar(track: &Path, synced: &str) -> io::Result<()> {
+    fs::write(sidecar_path(track), synced)
+}
+
+/// Letra guardada junto a la canción (.lrc primero, luego .lyrics.txt).
+pub fn load_local(track: &Path) -> Option<String> {
+    read_nonempty(&sidecar_path(track)).or_else(|| read_nonempty(&plain_path(track)))
+}
+
+/// Guarda el texto: como .lrc si trae marcas de tiempo, si no como .lyrics.txt.
+/// Texto vacío = elimina la letra.
+pub fn save_local(track: &Path, text: &str) -> io::Result<()> {
+    let (lrc, txt) = (sidecar_path(track), plain_path(track));
+    let t = text.trim();
+    let remove = |p: &Path| match fs::remove_file(p) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    if t.is_empty() {
+        remove(&lrc)?;
+        return remove(&txt);
+    }
+    if parse_lrc(t).is_empty() {
+        fs::write(&txt, t)?;
+        remove(&lrc)
+    } else {
+        fs::write(&lrc, t)?;
+        remove(&txt)
     }
 }
+
+/// Para archivos sin etiquetas: deduce (artista, título) del nombre.
+/// "017 - Michael Jackson - Blame it" → ("Michael Jackson", "Blame it").
+/// Si no está claro, devuelve artista vacío y el nombre limpio como título.
+pub fn guess_artist_title(stem: &str) -> (String, String) {
+    let s = stem.trim();
+    let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    let s = if digits > 0 && s[digits..].starts_with([' ', '.', '-', '_', ')']) {
+        s[digits..].trim_start_matches([' ', '.', '-', '_', ')'])
+    } else {
+        s
+    };
+    let parts: Vec<&str> = s.split(" - ").collect();
+    if parts.len() == 2 {
+        (parts[0].trim().to_string(), parts[1].trim().to_string())
+    } else {
+        (String::new(), s.trim().to_string())
+    }
+}
+
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Dirección de búsqueda web para que el usuario copie la letra a mano.
+pub fn web_search_url(artist: &str, title: &str) -> String {
+    let q = format!("{artist} {title} letra");
+    format!("https://www.google.com/search?q={}", url_encode(q.trim()))
+}
+
+// ---------------------------------------------------------------------------
+// Formato LRC
+// ---------------------------------------------------------------------------
 
 /// Convierte texto .lrc en líneas ordenadas por tiempo. Admite varias marcas por línea.
 pub fn parse_lrc(text: &str) -> Vec<(Duration, String)> {
@@ -111,18 +243,6 @@ pub fn current_line(lines: &[(Duration, String)], pos: Duration) -> Option<usize
     lines.partition_point(|(t, _)| *t <= pos).checked_sub(1)
 }
 
-pub fn sidecar_path(track: &Path) -> PathBuf {
-    track.with_extension("lrc")
-}
-
-pub fn load_sidecar(track: &Path) -> Option<String> {
-    fs::read_to_string(sidecar_path(track)).ok().filter(|s| !s.trim().is_empty())
-}
-
-pub fn save_sidecar(track: &Path, synced: &str) -> std::io::Result<()> {
-    fs::write(sidecar_path(track), synced)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +262,41 @@ mod tests {
         assert_eq!(current_line(&l, Duration::from_secs(1)), None);
         assert_eq!(current_line(&l, Duration::from_secs(5)), Some(0));
         assert_eq!(current_line(&l, Duration::from_secs(99)), Some(1));
+    }
+
+    #[test]
+    fn guesses_names() {
+        let g = guess_artist_title;
+        assert_eq!(g("017 - Michael Jackson - Blame it on the boogie"), ("Michael Jackson".into(), "Blame it on the boogie".into()));
+        assert_eq!(g("02- Como Quisiera"), (String::new(), "Como Quisiera".into()));
+        assert_eq!(g("02 Celia"), (String::new(), "Celia".into()));
+        assert_eq!(g("2Pac - Changes"), ("2Pac".into(), "Changes".into()));
+        assert_eq!(g("003 - LO POCO - GALERIA - 2000").0, "");
+    }
+
+    #[test]
+    fn encodes_urls() {
+        assert_eq!(url_encode("Celia Cruz & año"), "Celia+Cruz+%26+a%C3%B1o");
+        assert!(web_search_url("A", "B c").ends_with("q=A+B+c+letra"));
+    }
+
+    #[test]
+    fn local_lyrics_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("pulso-lyr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let track = dir.join("tema.mp3");
+
+        assert!(load_local(&track).is_none());
+        save_local(&track, "Línea uno\nLínea dos").unwrap();
+        assert!(!sidecar_path(&track).exists() && plain_path(&track).exists());
+        assert_eq!(load_local(&track).unwrap(), "Línea uno\nLínea dos");
+
+        save_local(&track, "[00:01.00] Hola").unwrap(); // al sincronizar, reemplaza la plana
+        assert!(sidecar_path(&track).exists() && !plain_path(&track).exists());
+
+        save_local(&track, "  ").unwrap(); // vacío = eliminar
+        assert!(load_local(&track).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

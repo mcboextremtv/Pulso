@@ -1,7 +1,8 @@
-import { ListView } from "std-widgets.slint";
+import { ListView, LineEdit, TextEdit } from "std-widgets.slint";
 
 export struct TrackItem { id: int, title: string, artist: string, album: string, duration: string }
 export struct LyricLine { text: string, current: bool }
+export struct FolderItem { path: string, name: string, depth: int, count: int }
 
 component IconButton inherits Rectangle {
     in property <length> size: 40px;
@@ -12,6 +13,17 @@ component IconButton inherits Rectangle {
     border-radius: size / 2;
     background: ta.has-hover ? #ffffff2e : fill;
     @children
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component TextButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    callback clicked;
+    height: 30px;
+    border-radius: 6px;
+    background: root.primary ? (ta.has-hover ? #3b82f6 : #2f6fe0) : (ta.has-hover ? #ffffff2e : #ffffff14);
+    Text { text: root.label; color: #ffffff; font-size: 12px; overflow: elide; }
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
@@ -38,9 +50,9 @@ component Bar inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "Pulso";
-    preferred-width: 1000px;
+    preferred-width: 1180px;
     preferred-height: 640px;
-    min-width: 760px;
+    min-width: 920px;
     min-height: 480px;
     background: #0e1014;
 
@@ -56,6 +68,14 @@ export component MainWindow inherits Window {
     in property <float> progress;
     in property <bool> playing;
     in-out property <float> volume: 0.8;
+    in property <[FolderItem]> folders;
+    in-out property <string> selected-folder: "";
+    in-out property <bool> editing: false;
+    in-out property <string> edit-text;
+    in-out property <string> edit-artist;
+    in-out property <string> edit-title;
+    in property <string> edit-name;
+    in property <string> edit-status;
 
     callback open-folder();
     callback play-track(int);
@@ -65,10 +85,44 @@ export component MainWindow inherits Window {
     callback seek(float);
     callback volume-changed(float);
     callback search(string);
+    callback folder-selected(string);
+    callback edit-lyrics();
+    callback cancel-edit();
+    callback save-lyrics(string);
+    callback delete-lyrics();
+    callback search-lyrics(string, string);
+    callback web-lyrics(string, string);
 
     VerticalLayout {
         HorizontalLayout {
             vertical-stretch: 1;
+
+            // ---- Carpetas ----
+            Rectangle {
+                width: 220px;
+                background: #0b0d11;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: "Carpetas"; color: #9aa0a6; font-size: 12px; }
+                    ListView {
+                        vertical-stretch: 1;
+                        for f[i] in root.folders: Rectangle {
+                            height: 32px;
+                            border-radius: 6px;
+                            background: f.path == root.selected-folder ? #22304a : (fta.has-hover ? #ffffff0d : transparent);
+                            HorizontalLayout {
+                                padding-left: 10px + f.depth * 14px;
+                                padding-right: 8px;
+                                spacing: 6px;
+                                Text { text: f.name; color: f.path == root.selected-folder ? #ffffff : #c4c7cc; font-size: 13px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                                Text { text: "\{f.count}"; color: #6b7280; font-size: 11px; vertical-alignment: center; }
+                            }
+                            fta := TouchArea { clicked => { root.folder-selected(f.path); } }
+                        }
+                    }
+                }
+            }
 
             // ---- Biblioteca ----
             VerticalLayout {
@@ -133,14 +187,19 @@ export component MainWindow inherits Window {
 
             // ---- Letra ----
             Rectangle {
-                width: 320px;
+                width: 340px;
                 background: #12151b;
                 VerticalLayout {
                     padding: 16px;
                     spacing: 8px;
-                    Text { text: "Letra"; color: #9aa0a6; font-size: 12px; }
-                    Text { text: root.lyrics-status; color: #6b7280; font-size: 12px; visible: root.lyrics-status != ""; }
-                    ListView {
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text { text: root.editing ? "Editar letra" : "Letra"; color: #9aa0a6; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                        if !root.editing && root.current-id >= 0: TextButton { label: "Editar"; width: 64px; clicked => { root.edit-lyrics(); } }
+                        if !root.editing && root.current-id >= 0: TextButton { label: "Eliminar"; width: 72px; clicked => { root.delete-lyrics(); } }
+                    }
+                    if !root.editing: Text { text: root.lyrics-status; color: #6b7280; font-size: 12px; wrap: word-wrap; visible: root.lyrics-status != ""; }
+                    if !root.editing: ListView {
                         vertical-stretch: 1;
                         for l in root.lyrics: Text {
                             height: 32px;
@@ -150,6 +209,25 @@ export component MainWindow inherits Window {
                             color: l.current ? #ffffff : #6b7280;
                             font-size: l.current ? 18px : 15px;
                             font-weight: l.current ? 700 : 400;
+                        }
+                    }
+                    if root.editing: VerticalLayout {
+                        vertical-stretch: 1;
+                        spacing: 8px;
+                        Text { text: root.edit-name; color: #c4c7cc; font-size: 12px; overflow: elide; }
+                        LineEdit { placeholder-text: "Artista"; text <=> root.edit-artist; }
+                        LineEdit { placeholder-text: "Título"; text <=> root.edit-title; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            TextButton { label: "Buscar letra"; clicked => { root.search-lyrics(root.edit-artist, root.edit-title); } }
+                            TextButton { label: "Buscar en la web"; clicked => { root.web-lyrics(root.edit-artist, root.edit-title); } }
+                        }
+                        Text { text: root.edit-status; color: #8ab4ff; font-size: 11px; wrap: word-wrap; visible: root.edit-status != ""; }
+                        TextEdit { vertical-stretch: 1; text <=> root.edit-text; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            TextButton { label: "Guardar"; primary: true; clicked => { root.save-lyrics(root.edit-text); } }
+                            TextButton { label: "Cancelar"; clicked => { root.cancel-edit(); } }
                         }
                     }
                 }
