@@ -3,7 +3,7 @@
 slint::include_modules!();
 
 use pulso_core::{
-    library::{Library, Track},
+    library::{Library, Track, TrackQuery},
     lyrics, paths,
     player::{PlayState, Player},
     settings::Settings,
@@ -16,8 +16,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Default, Clone, Copy, PartialEq)]
+enum InputKind {
+    #[default]
+    None,
+    New,
+    Rename,
+}
+
 #[derive(Default)]
 struct State {
+    /// "folders" o "lists"
+    mode: String,
+    /// Lista seleccionada (-1 = ninguna / todas las canciones)
+    playlist: i64,
+    /// Canciones a añadir cuando se elija una lista en el diálogo
+    pending_paths: Vec<String>,
+    input: InputKind,
     /// Pistas en el orden de la lista (sin las filas de grupo).
     view: Vec<Track>,
     /// Fila de la interfaz que ocupa cada pista de `view` (hay filas extra con grupos).
@@ -69,6 +84,8 @@ fn save_settings(ui: &MainWindow) {
         sort_desc: ui.get_sort_desc(),
         group_artist: ui.get_group_artist(),
         audio_buffer: ui.get_audio_buffer().max(1024) as u32,
+        sidebar_mode: ui.get_sidebar_mode().to_string(),
+        acoustid_key: ui.get_acoustid_key().to_string(),
     };
     let _ = s.save();
 }
@@ -126,16 +143,34 @@ fn build_rows(view: &[Track], group: bool) -> (Vec<TrackItem>, Vec<usize>) {
     (items, rows)
 }
 
-/// Recarga la lista (búsqueda, carpeta, orden y agrupación) en segundo plano.
+/// Recarga la lista (búsqueda, carpeta o lista, orden y agrupación) en segundo plano.
 fn refresh_view(ui: Weak<MainWindow>, st: Shared) {
     thread::spawn(move || {
-        let (query, folder, col, desc, group) = {
+        let (query, folder, col, desc, group, playlist) = {
             let g = st.lock().unwrap();
-            (g.query.clone(), g.folder.clone(), g.sort_col.clone(), g.sort_desc, g.group)
+            let in_lists = g.mode == "lists";
+            (
+                g.query.clone(),
+                if in_lists { String::new() } else { g.folder.clone() },
+                g.sort_col.clone(),
+                g.sort_desc,
+                g.group,
+                if in_lists && g.playlist >= 0 { Some(g.playlist) } else { None },
+            )
         };
         let prefix = if folder.is_empty() { String::new() } else { format!("{folder}{}", std::path::MAIN_SEPARATOR) };
         let tracks = Library::open(&paths::db_path())
-            .and_then(|lib| lib.search_sorted(&query, &prefix, &col, desc, group, 100_000))
+            .and_then(|lib| {
+                lib.query_tracks(&TrackQuery {
+                    text: &query,
+                    folder_prefix: &prefix,
+                    playlist,
+                    sort_col: &col,
+                    desc,
+                    group_by_artist: group,
+                    limit: 100_000,
+                })
+            })
             .unwrap_or_default();
         let st2 = st.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -147,11 +182,39 @@ fn refresh_view(ui: Weak<MainWindow>, st: Shared) {
                 g.ui_rows = rows;
             }
             ui.set_tracks(model(items));
-            if n == 0 && ui.get_status_text().is_empty() {
-                ui.set_status_text("No hay canciones aquí: usa «Agregar carpeta».".into());
+            if n == 0 && (playlist.is_some() || ui.get_status_text().is_empty()) {
+                let msg = if playlist.is_some() {
+                    "Esta lista está vacía: añade canciones con el botón + de cada fila."
+                } else {
+                    "No hay canciones aquí: usa «Agregar carpeta»."
+                };
+                ui.set_status_text(msg.into());
             }
         });
     });
+}
+
+/// Recarga las listas de reproducción (barra lateral y selector «añadir a…»).
+fn refresh_playlists(ui: Weak<MainWindow>) {
+    thread::spawn(move || {
+        let (total, lists) = Library::open(&paths::db_path())
+            .and_then(|lib| Ok((lib.count()?, lib.playlists()?)))
+            .unwrap_or((0, vec![]));
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            let real: Vec<PlaylistItem> = lists
+                .iter()
+                .map(|l| PlaylistItem { id: l.id as i32, name: l.name.clone().into(), count: l.count as i32 })
+                .collect();
+            let mut all = vec![PlaylistItem { id: -1, name: "Todas las canciones".into(), count: total as i32 }];
+            all.extend(real.iter().cloned());
+            ui.set_playlists(model(all));
+            ui.set_pick_lists(model(real));
+        });
+    });
+}
+
+fn say(ui: Weak<MainWindow>, msg: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_status_text(msg.into()));
 }
 
 /// Reconstruye el árbol de carpetas del panel izquierdo.
@@ -199,6 +262,7 @@ fn scan_folder(ui: Weak<MainWindow>, st: Shared, root: PathBuf) {
         };
         let _ = ui.upgrade_in_event_loop(move |ui| ui.set_status_text(msg.into()));
         refresh_folders(ui.clone());
+        refresh_playlists(ui.clone());
         refresh_view(ui, st);
     });
 }
@@ -409,7 +473,11 @@ fn main() {
     player.set_buffer(cfg.audio_buffer);
     player.set_volume(0.8);
 
+    ui.set_sidebar_mode(cfg.sidebar_mode.clone().into());
+    ui.set_acoustid_key(cfg.acoustid_key.clone().into());
     let st: Shared = Arc::new(Mutex::new(State {
+        mode: cfg.sidebar_mode.clone(),
+        playlist: -1,
         last_lyric: -2,
         sort_col: cfg.sort_col,
         sort_desc: cfg.sort_desc,
@@ -558,6 +626,214 @@ fn main() {
         let p = player.clone();
         move |v| p.set_volume(v)
     });
+
+    // ---- Listas de reproducción ----
+    ui.on_mode_changed({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |mode| {
+            let Some(ui) = w.upgrade() else { return };
+            st.lock().unwrap().mode = mode.to_string();
+            ui.set_sidebar_mode(mode);
+            ui.set_status_text("".into());
+            save_settings(&ui);
+            refresh_playlists(w.clone());
+            refresh_view(w.clone(), st.clone());
+        }
+    });
+    ui.on_playlist_selected({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |id| {
+            let Some(ui) = w.upgrade() else { return };
+            st.lock().unwrap().playlist = id as i64;
+            ui.set_selected_playlist(id);
+            ui.set_status_text("".into());
+            refresh_view(w.clone(), st.clone());
+        }
+    });
+    ui.on_new_playlist({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            st.lock().unwrap().input = InputKind::New;
+            ui.set_input_title("Nueva lista".into());
+            ui.set_input_text("".into());
+            ui.set_input_open(true);
+        }
+    });
+    ui.on_rename_playlist({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let id = ui.get_selected_playlist();
+            let name = ui.get_playlists().iter().find(|p| p.id == id).map(|p| p.name).unwrap_or_default();
+            st.lock().unwrap().input = InputKind::Rename;
+            ui.set_input_title("Renombrar lista".into());
+            ui.set_input_text(name);
+            ui.set_input_open(true);
+        }
+    });
+    ui.on_input_accepted({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |text| {
+            let Some(ui) = w.upgrade() else { return };
+            let (kind, selected) = (st.lock().unwrap().input, ui.get_selected_playlist() as i64);
+            let name = text.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            ui.set_input_open(false);
+            st.lock().unwrap().input = InputKind::None;
+            let (weak, st) = (w.clone(), st.clone());
+            thread::spawn(move || {
+                let res = Library::open(&paths::db_path()).and_then(|lib| match kind {
+                    InputKind::New => lib.create_playlist(&name).map(Some),
+                    InputKind::Rename => lib.rename_playlist(selected, &name).map(|_| None),
+                    InputKind::None => Ok(None),
+                });
+                match res {
+                    Ok(new_id) => {
+                        refresh_playlists(weak.clone());
+                        if let Some(id) = new_id {
+                            st.lock().unwrap().playlist = id;
+                            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_selected_playlist(id as i32));
+                            refresh_view(weak, st);
+                        }
+                    }
+                    Err(e) => say(weak, format!("No se pudo guardar la lista: {e}")),
+                }
+            });
+        }
+    });
+    ui.on_delete_playlist({
+        let w = ui.as_weak();
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let id = ui.get_selected_playlist();
+            let name = ui.get_playlists().iter().find(|p| p.id == id).map(|p| p.name).unwrap_or_default();
+            ui.set_confirm_text(format!("¿Eliminar la lista «{name}»? Las canciones no se borran de tu disco.").into());
+            ui.set_confirm_open(true);
+        }
+    });
+    ui.on_confirm_accepted({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let id = ui.get_selected_playlist() as i64;
+            ui.set_confirm_open(false);
+            ui.set_selected_playlist(-1);
+            ui.set_status_text("".into());
+            st.lock().unwrap().playlist = -1;
+            let (weak, st) = (w.clone(), st.clone());
+            thread::spawn(move || {
+                if let Err(e) = Library::open(&paths::db_path()).and_then(|mut lib| lib.delete_playlist(id)) {
+                    say(weak.clone(), format!("No se pudo eliminar la lista: {e}"));
+                }
+                refresh_playlists(weak.clone());
+                refresh_view(weak, st);
+            });
+        }
+    });
+    ui.on_add_row({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |index| {
+            let Some(ui) = w.upgrade() else { return };
+            let Some(tr) = st.lock().unwrap().view.get(index.max(0) as usize).cloned() else { return };
+            ui.set_pick_title(format!("Añadir «{}» a…", tr.title).into());
+            ui.set_pick_new_name("".into());
+            st.lock().unwrap().pending_paths = vec![tr.path];
+            ui.set_pick_open(true);
+        }
+    });
+    ui.on_add_all({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let paths: Vec<String> = st.lock().unwrap().view.iter().map(|t| t.path.clone()).collect();
+            ui.set_pick_title(format!("Añadir las {} canciones que ves a…", paths.len()).into());
+            ui.set_pick_new_name("".into());
+            st.lock().unwrap().pending_paths = paths;
+            ui.set_pick_open(true);
+        }
+    });
+    // Añade `pending_paths` a una lista existente o recién creada y avisa del resultado.
+    fn add_pending(weak: Weak<MainWindow>, st: Shared, target: Result<i64, String>) {
+        let paths = std::mem::take(&mut st.lock().unwrap().pending_paths);
+        thread::spawn(move || {
+            let msg = match target {
+                Err(e) => format!("No se pudo crear la lista: {e}"),
+                Ok(id) => Library::open(&paths::db_path())
+                    .and_then(|mut lib| {
+                        let added = lib.add_to_playlist(id, &paths)?;
+                        let name = lib.playlists()?.into_iter().find(|l| l.id == id).map(|l| l.name).unwrap_or_default();
+                        Ok((added, name))
+                    })
+                    .map(|(added, name)| {
+                        let skipped = paths.len() - added;
+                        match (added, skipped) {
+                            (0, _) => format!("Ya estaban todas en «{name}»."),
+                            (n, 0) => format!("Añadidas {n} a «{name}»."),
+                            (n, k) => format!("Añadidas {n} a «{name}» ({k} ya estaban)."),
+                        }
+                    })
+                    .unwrap_or_else(|e| format!("No se pudo añadir: {e}")),
+            };
+            say(weak.clone(), msg);
+            refresh_playlists(weak);
+        });
+    }
+    ui.on_pick_playlist({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |id| {
+            if let Some(ui) = w.upgrade() {
+                ui.set_pick_open(false);
+            }
+            add_pending(w.clone(), st.clone(), Ok(id as i64));
+        }
+    });
+    ui.on_pick_new({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |name| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            if let Some(ui) = w.upgrade() {
+                ui.set_pick_open(false);
+            }
+            let created = Library::open(&paths::db_path())
+                .and_then(|lib| lib.create_playlist(&name))
+                .map_err(|e| e.to_string());
+            add_pending(w.clone(), st.clone(), created);
+        }
+    });
+    ui.on_remove_row({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |index| {
+            let (tr, playlist) = {
+                let g = st.lock().unwrap();
+                (g.view.get(index.max(0) as usize).cloned(), g.playlist)
+            };
+            let Some(tr) = tr else { return };
+            let (weak, st) = (w.clone(), st.clone());
+            thread::spawn(move || {
+                let _ = Library::open(&paths::db_path()).and_then(|lib| lib.remove_from_playlist(playlist, &tr.path));
+                refresh_playlists(weak.clone());
+                refresh_view(weak, st);
+            });
+        }
+    });
+
+    // ---- Identificación (AcoustID): solo se guarda la clave del usuario ----
+    ui.on_save_acoustid({
+        let w = ui.as_weak();
+        move |key| {
+            let Some(ui) = w.upgrade() else { return };
+            let clean: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            ui.set_acoustid_key(clean.into());
+            save_settings(&ui);
+        }
+    });
+    ui.on_open_acoustid_page(|| open_url("https://acoustid.org/new-application"));
 
     // ---- Editor de letras ----
     ui.on_edit_lyrics({
@@ -738,6 +1014,7 @@ fn main() {
     });
 
     refresh_folders(ui.as_weak());
+    refresh_playlists(ui.as_weak());
     refresh_view(ui.as_weak(), st.clone());
 
     if bench {

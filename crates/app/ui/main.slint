@@ -3,6 +3,7 @@ import { ListView, ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
 export struct TrackItem { id: int, index: int, header: bool, title: string, artist: string, album: string, duration: string }
 export struct LyricLine { text: string, current: bool }
 export struct FolderItem { path: string, name: string, depth: int, count: int }
+export struct PlaylistItem { id: int, name: string, count: int }
 
 component IconButton inherits Rectangle {
     in property <length> size: 40px;
@@ -109,6 +110,7 @@ component LyricRow inherits Text {
 
 export component MainWindow inherits Window {
     title: "Pulso";
+    icon: @image-url("../assets/icon.png");
     preferred-width: 1280px;
     preferred-height: 680px;
     min-width: 900px;
@@ -118,6 +120,11 @@ export component MainWindow inherits Window {
     in property <[TrackItem]> tracks;
     in property <[LyricLine]> lyrics;
     in property <[FolderItem]> folders;
+    in property <[PlaylistItem]> playlists;      // incluye «Todas las canciones» con id -1
+    in property <[PlaylistItem]> pick-lists;     // solo listas reales (para «añadir a…»)
+    in-out property <string> sidebar-mode: "folders";
+    in-out property <int> selected-playlist: -1;
+    property <bool> in-playlist: root.sidebar-mode == "lists" && root.selected-playlist >= 0;
     in property <string> lyrics-status;
     in property <int> current-id: -1;
     in property <string> now-title;
@@ -139,7 +146,7 @@ export component MainWindow inherits Window {
     // Espacio útil para título + artista + álbum, y anchos efectivos: si el panel se estrecha,
     // las columnas se encogen para que "Dur." y el lápiz nunca queden fuera.
     property <length> center-w: 640px; // se actualiza desde el panel central (evita un bucle de diseño)
-    property <length> avail: max(200px, root.center-w - 32px - 148px);
+    property <length> avail: max(200px, root.center-w - 32px - 186px);
     property <length> eff-artist: min(root.artist-w, max(60px, root.avail * 0.4));
     property <length> eff-title: min(root.title-w, max(80px, root.avail - root.eff-artist - 60px));
     in-out property <string> sort-col: "";
@@ -163,6 +170,17 @@ export component MainWindow inherits Window {
     in property <string> tags-path;
     in property <string> tags-status;
     in-out property <bool> settings-open: false;
+    in-out property <string> acoustid-key;
+
+    // Diálogos de listas
+    in-out property <bool> input-open: false;
+    in property <string> input-title;
+    in-out property <string> input-text;
+    in-out property <bool> confirm-open: false;
+    in property <string> confirm-text;
+    in-out property <bool> pick-open: false;
+    in property <string> pick-title;
+    in-out property <string> pick-new-name;
 
     callback open-folder();
     callback play-track(int);
@@ -185,12 +203,28 @@ export component MainWindow inherits Window {
     callback edit-tags(int);
     callback save-tags(string, string, string);
     callback set-buffer(int);
+    callback mode-changed(string);
+    callback playlist-selected(int);
+    callback new-playlist();
+    callback rename-playlist();
+    callback delete-playlist();
+    callback input-accepted(string);
+    callback confirm-accepted();
+    callback add-row(int);
+    callback add-all();
+    callback remove-row(int);
+    callback pick-playlist(int);
+    callback pick-new(string);
+    callback save-acoustid(string);
+    callback open-acoustid-page();
 
-    // Desplaza la lista solo si la fila no se ve (la fila mide 40 px).
+    // Desplaza la lista lo mínimo para que se vea la fila (mide 40 px); si ya se ve, no mueve nada.
     public function ensure-visible(row: int) {
         if (row >= 0) {
-            if (row * 40px < -track-list.content-y || (row + 1) * 40px > -track-list.content-y + track-list.visible-height) {
-                track-list.content-y = clamp(-(row * 40px - track-list.visible-height / 2 + 20px), min(0px, track-list.visible-height - track-list.content-height), 0px);
+            if (row * 40px < -track-list.content-y) {
+                track-list.content-y = -(row * 40px);
+            } else if ((row + 1) * 40px > -track-list.content-y + track-list.visible-height) {
+                track-list.content-y = -((row + 1) * 40px - track-list.visible-height);
             }
         }
     }
@@ -199,15 +233,19 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             vertical-stretch: 1;
 
-            // ---- Carpetas ----
+            // ---- Carpetas / Listas ----
             Rectangle {
                 width: root.sidebar-w;
                 background: #0b0d11;
                 VerticalLayout {
                     padding: 12px;
                     spacing: 8px;
-                    Text { text: "Carpetas"; color: #9aa0a6; font-size: 12px; }
-                    ListView {
+                    HorizontalLayout {
+                        spacing: 6px;
+                        TextButton { label: "Carpetas"; primary: root.sidebar-mode == "folders"; clicked => { root.mode-changed("folders"); } }
+                        TextButton { label: "Listas"; primary: root.sidebar-mode == "lists"; clicked => { root.mode-changed("lists"); } }
+                    }
+                    if root.sidebar-mode == "folders": ListView {
                         vertical-stretch: 1;
                         for f[i] in root.folders: Rectangle {
                             height: 32px;
@@ -222,6 +260,28 @@ export component MainWindow inherits Window {
                             }
                             fta := TouchArea { clicked => { root.folder-selected(f.path); } }
                         }
+                    }
+                    if root.sidebar-mode == "lists": ListView {
+                        vertical-stretch: 1;
+                        for pl in root.playlists: Rectangle {
+                            height: 32px;
+                            border-radius: 6px;
+                            background: pl.id == root.selected-playlist ? #22304a : (pta.has-hover ? #ffffff0d : transparent);
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 8px;
+                                spacing: 6px;
+                                Text { text: pl.name; color: pl.id == root.selected-playlist ? #ffffff : #c4c7cc; font-size: 13px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                                Text { text: "\{pl.count}"; color: #6b7280; font-size: 11px; vertical-alignment: center; }
+                            }
+                            pta := TouchArea { clicked => { root.playlist-selected(pl.id); } }
+                        }
+                    }
+                    if root.sidebar-mode == "lists": TextButton { label: "Nueva lista"; primary: true; clicked => { root.new-playlist(); } }
+                    if root.sidebar-mode == "lists" && root.selected-playlist >= 0: HorizontalLayout {
+                        spacing: 6px;
+                        TextButton { label: "Renombrar"; clicked => { root.rename-playlist(); } }
+                        TextButton { label: "Eliminar"; clicked => { root.delete-playlist(); } }
                     }
                 }
             }
@@ -291,6 +351,7 @@ export component MainWindow inherits Window {
                         HeaderCell { horizontal-stretch: 1; label: "Álbum"; active: root.sort-col == "album"; desc: root.sort-desc; clicked => { root.header-clicked("album"); } }
                         HeaderCell { width: 56px; label: "Dur."; active: root.sort-col == "duration"; desc: root.sort-desc; clicked => { root.header-clicked("duration"); } }
                         Rectangle { width: 28px; }
+                        Rectangle { width: 28px; }
                     }
                     Splitter { x: 12px + root.eff-title + 2px; height: parent.height; value <=> root.title-w; min-value: 100px; max-value: max(100px, root.avail - root.eff-artist - 60px); released => { root.layout-changed(); } }
                     Splitter { x: 12px + root.eff-title + 10px + root.eff-artist + 2px; height: parent.height; value <=> root.artist-w; min-value: 60px; max-value: max(60px, root.avail - root.eff-title - 60px); released => { root.layout-changed(); } }
@@ -337,12 +398,34 @@ export component MainWindow inherits Window {
                                         fill: edit-ta.has-hover ? #8ab4ff : #6b7280;
                                     }
                                 }
+                                Rectangle {
+                                    width: 28px;
+                                    pl-ta := TouchArea {
+                                        clicked => {
+                                            if (root.in-playlist) { root.remove-row(t.index); } else { root.add-row(t.index); }
+                                        }
+                                    }
+                                    Path {
+                                        x: (parent.width - 12px) / 2;
+                                        y: (parent.height - 12px) / 2;
+                                        width: 12px;
+                                        height: 12px;
+                                        viewbox-width: 12;
+                                        viewbox-height: 12;
+                                        commands: root.in-playlist ? "M 0 5 L 12 5 L 12 7 L 0 7 Z" : "M 5 0 L 7 0 L 7 5 L 12 5 L 12 7 L 7 7 L 7 12 L 5 12 L 5 7 L 0 7 L 0 5 L 5 5 Z";
+                                        fill: pl-ta.has-hover ? #8ab4ff : #6b7280;
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                Text { text: root.status-text; color: #6b7280; font-size: 12px; overflow: elide; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: root.status-text; color: #6b7280; font-size: 12px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                    if root.tracks.length > 0 && !root.in-playlist: TextButton { label: "Añadir todas a una lista"; width: 180px; height: 26px; clicked => { root.add-all(); } }
+                }
             }
             Splitter { value <=> root.lyrics-w; sign: -1; min-value: 220px; max-value: 640px; released => { root.layout-changed(); } }
 
@@ -512,8 +595,8 @@ export component MainWindow inherits Window {
         background: #000000b8;
         TouchArea { }
         Rectangle {
-            width: 520px;
-            height: 320px;
+            width: 560px;
+            height: 470px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #1a1d24;
@@ -531,9 +614,118 @@ export component MainWindow inherits Window {
                     TextButton { label: "Máximo"; primary: root.audio-buffer == 32768; clicked => { root.set-buffer(32768); } }
                 }
                 Text { text: "Búfer actual: \{root.audio-buffer} tramas (unos \{round(root.audio-buffer / 48.0)} ms a 48 kHz)"; color: #8ab4ff; font-size: 12px; }
-                Text { text: "Cortes de audio detectados en esta sesión: \{root.underruns}"; color: #8ab4ff; font-size: 12px; vertical-stretch: 1; }
+                Text { text: "Cortes de audio detectados en esta sesión: \{root.underruns}"; color: #8ab4ff; font-size: 12px; }
+                Text { text: "Identificación de canciones (AcoustID)"; color: #ffffff; font-size: 13px; font-weight: 600; }
+                Text { text: "Pega aquí tu clave de APLICACIÓN de AcoustID (gratuita: acoustid.org/new-application). No es la «clave de usuario» que se ve al iniciar sesión. Se usará para identificar canciones solo cuando tú lo pidas."; color: #9aa0a6; font-size: 12px; wrap: word-wrap; }
                 HorizontalLayout {
-                    TextButton { label: "Cerrar"; width: 90px; clicked => { root.settings-open = false; } }
+                    spacing: 8px;
+                    LineEdit { placeholder-text: "Clave de aplicación de AcoustID"; text <=> root.acoustid-key; horizontal-stretch: 1; }
+                    TextButton { label: "Obtener clave"; width: 110px; clicked => { root.open-acoustid-page(); } }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    TextButton { label: "Cerrar"; width: 90px; clicked => { root.save-acoustid(root.acoustid-key); root.settings-open = false; } }
+                }
+            }
+        }
+    }
+
+    // ---- Diálogo: nombre de lista (crear / renombrar) ----
+    if root.input-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+        TouchArea { }
+        Rectangle {
+            width: 420px;
+            height: 190px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1d24;
+            border-radius: 10px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text { text: root.input-title; color: #ffffff; font-size: 16px; font-weight: 700; }
+                LineEdit { placeholder-text: "Nombre de la lista"; text <=> root.input-text; accepted => { root.input-accepted(root.input-text); } }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    TextButton { label: "Aceptar"; primary: true; clicked => { root.input-accepted(root.input-text); } }
+                    TextButton { label: "Cancelar"; clicked => { root.input-open = false; } }
+                }
+            }
+        }
+    }
+
+    // ---- Diálogo: confirmar eliminación ----
+    if root.confirm-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+        TouchArea { }
+        Rectangle {
+            width: 440px;
+            height: 170px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1d24;
+            border-radius: 10px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text { text: root.confirm-text; color: #ffffff; font-size: 14px; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    TextButton { label: "Eliminar lista"; primary: true; clicked => { root.confirm-accepted(); } }
+                    TextButton { label: "Cancelar"; clicked => { root.confirm-open = false; } }
+                }
+            }
+        }
+    }
+
+    // ---- Diálogo: añadir a una lista ----
+    if root.pick-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+        TouchArea { }
+        Rectangle {
+            width: 440px;
+            height: 430px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1d24;
+            border-radius: 10px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: root.pick-title; color: #ffffff; font-size: 15px; font-weight: 700; wrap: word-wrap; }
+                if root.pick-lists.length == 0: Text { text: "Aún no tienes listas: crea la primera aquí abajo."; color: #9aa0a6; font-size: 12px; vertical-stretch: 1; }
+                if root.pick-lists.length > 0: ListView {
+                    vertical-stretch: 1;
+                    for pl in root.pick-lists: Rectangle {
+                        height: 36px;
+                        border-radius: 6px;
+                        background: pk-ta.has-hover ? #22304a : transparent;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+                            Text { text: pl.name; color: #ffffff; font-size: 14px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                            Text { text: "\{pl.count}"; color: #6b7280; font-size: 12px; vertical-alignment: center; }
+                        }
+                        pk-ta := TouchArea { clicked => { root.pick-playlist(pl.id); } }
+                    }
+                }
+                Text { text: "O crea una lista nueva con ellas:"; color: #9aa0a6; font-size: 12px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { placeholder-text: "Nombre de la nueva lista"; text <=> root.pick-new-name; horizontal-stretch: 1; accepted => { root.pick-new(root.pick-new-name); } }
+                    TextButton { label: "Crear y añadir"; width: 120px; primary: true; clicked => { root.pick-new(root.pick-new-name); } }
+                }
+                HorizontalLayout {
+                    TextButton { label: "Cancelar"; width: 90px; clicked => { root.pick-open = false; } }
                 }
             }
         }

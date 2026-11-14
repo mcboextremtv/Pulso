@@ -13,6 +13,10 @@ pub struct Settings {
     pub sort_desc: bool,
     pub group_artist: bool,
     pub audio_buffer: u32,
+    /// "folders" o "lists"
+    pub sidebar_mode: String,
+    /// Clave de aplicación de AcoustID (la pone cada usuario)
+    pub acoustid_key: String,
 }
 
 impl Default for Settings {
@@ -26,6 +30,8 @@ impl Default for Settings {
             sort_desc: false,
             group_artist: false,
             audio_buffer: DEFAULT_BUFFER_FRAMES,
+            sidebar_mode: "folders".into(),
+            acoustid_key: String::new(),
         }
     }
 }
@@ -47,6 +53,10 @@ impl Settings {
                 }
                 "sort_desc" => s.sort_desc = v == "true",
                 "group_artist" => s.group_artist = v == "true",
+                "sidebar_mode" if v == "folders" || v == "lists" => s.sidebar_mode = v.to_string(),
+                "acoustid_key" if v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                    s.acoustid_key = v.to_string()
+                }
                 "audio_buffer" => {
                     s.audio_buffer = v.parse().ok().filter(|n| (1024..=65536).contains(n)).unwrap_or(s.audio_buffer)
                 }
@@ -58,7 +68,7 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "sidebar_w={}\nlyrics_w={}\ntitle_w={}\nartist_w={}\nsort_col={}\nsort_desc={}\ngroup_artist={}\naudio_buffer={}\n",
+            "sidebar_w={}\nlyrics_w={}\ntitle_w={}\nartist_w={}\nsort_col={}\nsort_desc={}\ngroup_artist={}\naudio_buffer={}\nsidebar_mode={}\nacoustid_key={}\n",
             self.sidebar_w.round(),
             self.lyrics_w.round(),
             self.title_w.round(),
@@ -66,7 +76,9 @@ impl Settings {
             self.sort_col,
             self.sort_desc,
             self.group_artist,
-            self.audio_buffer
+            self.audio_buffer,
+            self.sidebar_mode,
+            self.acoustid_key
         )
     }
 
@@ -87,7 +99,7 @@ mod tests {
 
     #[test]
     fn roundtrip_and_sanitize() {
-        let s = Settings { sidebar_w: 300.0, sort_col: "artist".into(), sort_desc: true, group_artist: true, audio_buffer: 16384, ..Default::default() };
+        let s = Settings { sidebar_w: 300.0, sidebar_mode: "lists".into(), acoustid_key: "AbC123".into(), sort_col: "artist".into(), sort_desc: true, group_artist: true, audio_buffer: 16384, ..Default::default() };
         assert_eq!(Settings::parse(&s.to_text()), s);
         let bad = Settings::parse("sidebar_w=99999\nsort_col=drop table\naudio_buffer=3\nbasura");
         assert_eq!(bad.sidebar_w, 480.0);

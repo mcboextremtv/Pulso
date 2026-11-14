@@ -6,6 +6,12 @@ Reproductor de música libre, rápido y liviano. Sin telemetría, sin publicidad
 - **Interfaz en Slint** (`crates/app`) con renderizador por software: no necesita GPU, drivers ni runtimes externos. Un solo `.exe`.
 - El audio abre el dispositivo solo al reproducir y corre en su propio hilo. La red solo se usa al pedir una letra.
 
+## Hito 1.4: listas de reproducción, logo y clave de AcoustID
+- **Listas tipo iTunes:** pestañas *Carpetas* / *Listas* en la barra lateral; tú eliges cómo navegar. En *Listas*: *Nueva lista*, *Renombrar*, *Eliminar* (no borra canciones). El botón **+** de cada fila abre «añadir a…» (lista existente o nueva); **Añadir todas a una lista** añade de una vez lo que estás viendo (una carpeta, o los resultados de una búsqueda). Dentro de una lista el botón es **−** (quitar de la lista). Las listas se enlazan por ruta de archivo: si un disco se desconecta y reaparece, sus canciones vuelven a la lista. No admiten canciones repetidas.
+- **Logo e icono:** `assets/` trae `icon.svg`, `icon-*.png`, `icon.ico` y `favicon.ico`/`favicon.svg` (para la página del repositorio). El icono se incrusta en el `.exe` y se usa en la ventana.
+- **Ajustes → AcoustID:** cuadro para la clave de *aplicación* (no la de usuario) y botón que abre https://acoustid.org/new-application. Por ahora solo se guarda; la identificación de canciones viene después.
+- El desplazamiento al pasar de pista mueve la lista lo mínimo necesario.
+
 ## Hito 1.3: tabla, paneles ajustables y etiquetas
 - **Paneles ajustables:** arrastra los divisores entre carpetas, canciones y letra; los tamaños se guardan (`%APPDATA%\Pulso\settings.txt`).
 - **Tabla con columnas alineadas:** Título, Artista, Álbum y Duración. Clic en una cabecera ordena ascendente, otro clic descendente, un tercero vuelve al orden de carpeta. Arrastra el borde de una cabecera para cambiar su ancho.

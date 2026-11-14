@@ -65,6 +65,26 @@ pub fn write_tags(path: &Path, title: &str, artist: &str, album: &str) -> Result
     Ok(())
 }
 
+/// Parámetros de una consulta de canciones.
+pub struct TrackQuery<'a> {
+    pub text: &'a str,
+    /// Prefijo de ruta (con separador final) o vacío.
+    pub folder_prefix: &'a str,
+    /// Si es `Some`, solo las canciones de esa lista, en el orden de la lista.
+    pub playlist: Option<i64>,
+    pub sort_col: &'a str,
+    pub desc: bool,
+    pub group_by_artist: bool,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistInfo {
+    pub id: i64,
+    pub name: String,
+    pub count: usize,
+}
+
 /// Carpeta de la vista en árbol (aplanada, con sangría por `depth`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderNode {
@@ -100,7 +120,21 @@ impl Library {
                  album       TEXT NOT NULL,
                  duration_ms INTEGER NOT NULL,
                  mtime       INTEGER NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS playlists (
+                 id      INTEGER PRIMARY KEY,
+                 name    TEXT NOT NULL,
+                 created INTEGER NOT NULL DEFAULT 0
+             );
+             -- Se enlaza por ruta (no por id): si un disco se desconecta y la biblioteca se
+             -- reescanea, la lista conserva sus canciones y vuelven a aparecer al reconectarlo.
+             CREATE TABLE IF NOT EXISTS playlist_items (
+                 playlist_id INTEGER NOT NULL,
+                 position    INTEGER NOT NULL,
+                 path        TEXT NOT NULL,
+                 PRIMARY KEY (playlist_id, path)
+             );
+             CREATE INDEX IF NOT EXISTS idx_items_path ON playlist_items(path);",
         )?;
         Ok(Self { conn })
     }
@@ -185,30 +219,57 @@ impl Library {
         group_by_artist: bool,
         limit: usize,
     ) -> Result<Vec<Track>> {
+        self.query_tracks(&TrackQuery {
+            text: query,
+            folder_prefix,
+            playlist: None,
+            sort_col,
+            desc,
+            group_by_artist,
+            limit,
+        })
+    }
+
+    /// Consulta general: texto, carpeta o lista, orden y agrupación.
+    /// Dentro de una lista, sin orden elegido, las pistas salen en el orden de la lista.
+    pub fn query_tracks(&self, q: &TrackQuery) -> Result<Vec<Track>> {
+        use rusqlite::types::Value;
         // Lista cerrada: el nombre de columna nunca viene del usuario tal cual.
-        let col = match sort_col {
-            "title" => "title COLLATE NOCASE",
-            "artist" => "artist COLLATE NOCASE",
-            "album" => "album COLLATE NOCASE",
-            "duration" => "duration_ms",
-            _ => "path COLLATE NOCASE",
+        let default_col = if q.playlist.is_some() { "p.position" } else { "t.path COLLATE NOCASE" };
+        let col = match q.sort_col {
+            "title" => "t.title COLLATE NOCASE",
+            "artist" => "t.artist COLLATE NOCASE",
+            "album" => "t.album COLLATE NOCASE",
+            "duration" => "t.duration_ms",
+            _ => default_col,
         };
-        let dir = if desc { "DESC" } else { "ASC" };
-        let order = if group_by_artist {
-            format!("artist COLLATE NOCASE ASC, {col} {dir}, path COLLATE NOCASE")
+        let dir = if q.desc { "DESC" } else { "ASC" };
+        let order = if q.group_by_artist {
+            format!("t.artist COLLATE NOCASE ASC, {col} {dir}, t.path COLLATE NOCASE")
         } else {
-            format!("{col} {dir}, path COLLATE NOCASE")
+            format!("{col} {dir}, t.path COLLATE NOCASE")
+        };
+        let mut params: Vec<Value> = vec![
+            Value::Text(format!("%{}%", q.text.trim())),
+            Value::Integer(q.limit as i64),
+            Value::Text(q.folder_prefix.to_string()),
+        ];
+        let join = match q.playlist {
+            Some(id) => {
+                params.push(Value::Integer(id));
+                "JOIN playlist_items p ON p.path = t.path AND p.playlist_id = ?4"
+            }
+            None => "",
         };
         let sql = format!(
-            "SELECT id, path, title, artist, album, duration_ms FROM tracks
-             WHERE (title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1)
-               AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
+            "SELECT t.id, t.path, t.title, t.artist, t.album, t.duration_ms FROM tracks t {join}
+             WHERE (t.title LIKE ?1 OR t.artist LIKE ?1 OR t.album LIKE ?1)
+               AND (?3 = '' OR substr(t.path, 1, length(?3)) = ?3)
              ORDER BY {order}
              LIMIT ?2"
         );
-        let like = format!("%{}%", query.trim());
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![like, limit as i64, folder_prefix], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
             Ok(Track {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -219,6 +280,82 @@ impl Library {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ---------------- Listas de reproducción ----------------
+
+    pub fn create_playlist(&self, name: &str) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("el nombre de la lista no puede estar vacío".into());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute("INSERT INTO playlists (name, created) VALUES (?1, ?2)", params![name, now])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("el nombre de la lista no puede estar vacío".into());
+        }
+        self.conn.execute("UPDATE playlists SET name = ?2 WHERE id = ?1", params![id, name])?;
+        Ok(())
+    }
+
+    /// Borra la lista (no las canciones).
+    pub fn delete_playlist(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM playlist_items WHERE playlist_id = ?1", [id])?;
+        tx.execute("DELETE FROM playlists WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Listas con su número de canciones disponibles ahora en la biblioteca.
+    pub fn playlists(&self) -> Result<Vec<PlaylistInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.id, l.name,
+                    (SELECT COUNT(*) FROM playlist_items i JOIN tracks t ON t.path = i.path
+                      WHERE i.playlist_id = l.id)
+             FROM playlists l ORDER BY l.name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PlaylistInfo { id: r.get(0)?, name: r.get(1)?, count: r.get::<_, i64>(2)? as usize })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Añade canciones al final de la lista, sin repetir las que ya están. Devuelve cuántas añadió.
+    pub fn add_to_playlist(&mut self, id: i64, paths: &[String]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position), 0) FROM playlist_items WHERE playlist_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let mut added = 0;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO playlist_items (playlist_id, position, path) VALUES (?1, ?2, ?3)",
+            )?;
+            for p in paths {
+                if ins.execute(params![id, next + 1, p])? > 0 {
+                    next += 1;
+                    added += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    pub fn remove_from_playlist(&self, id: i64, path: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?1 AND path = ?2", params![id, path])?;
+        Ok(())
     }
 
     /// Escribe título, artista y álbum en el archivo y actualiza la biblioteca.
@@ -429,5 +566,40 @@ mod tests {
         // Tras editar, un nuevo escaneo no debe tratarlo como cambiado.
         assert_eq!(lib.scan(&dir, |_| {}).unwrap().unchanged, 3);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlists_lifecycle() {
+        let mut lib = Library::open_in_memory().unwrap();
+        for (i, p) in ["/m/a.mp3", "/m/b.mp3", "/m/c.mp3"].iter().enumerate() {
+            lib.conn
+                .execute(
+                    "INSERT INTO tracks (path,title,artist,album,duration_ms,mtime) VALUES (?1,?2,'','',1000,0)",
+                    params![p, format!("t{}", 3 - i)], // títulos t3, t2, t1: orden alfabético inverso al de ruta
+                )
+                .unwrap();
+        }
+        let id = lib.create_playlist("  Mis favoritas ").unwrap();
+        assert!(lib.create_playlist("   ").is_err());
+
+        // Se añade en este orden: c, a. Un duplicado y una ruta inexistente no cuentan como canciones.
+        let added = lib.add_to_playlist(id, &["/m/c.mp3".into(), "/m/a.mp3".into(), "/m/c.mp3".into()]).unwrap();
+        assert_eq!(added, 2);
+        lib.add_to_playlist(id, &["/m/falta.mp3".into()]).unwrap();
+        assert_eq!(lib.playlists().unwrap(), vec![PlaylistInfo { id, name: "Mis favoritas".into(), count: 2 }]);
+
+        let q = |sort: &'static str| TrackQuery { text: "", folder_prefix: "", playlist: Some(id), sort_col: sort, desc: false, group_by_artist: false, limit: 10 };
+        let paths = |v: Vec<Track>| v.into_iter().map(|t| t.path).collect::<Vec<_>>();
+        assert_eq!(paths(lib.query_tracks(&q("")).unwrap()), ["/m/c.mp3", "/m/a.mp3"]); // orden de la lista
+        assert_eq!(paths(lib.query_tracks(&q("title")).unwrap()), ["/m/c.mp3", "/m/a.mp3"]); // t1 (c), t3 (a)
+
+        lib.remove_from_playlist(id, "/m/c.mp3").unwrap();
+        assert_eq!(lib.playlists().unwrap()[0].count, 1);
+        lib.rename_playlist(id, "Otro nombre").unwrap();
+        assert_eq!(lib.playlists().unwrap()[0].name, "Otro nombre");
+        assert_eq!(lib.search("", 10).unwrap().len(), 3); // las canciones siguen en la biblioteca
+
+        lib.delete_playlist(id).unwrap();
+        assert!(lib.playlists().unwrap().is_empty());
     }
 }
