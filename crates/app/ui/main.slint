@@ -1,6 +1,6 @@
-import { ListView, LineEdit, TextEdit } from "std-widgets.slint";
+import { ListView, ScrollView, LineEdit, TextEdit } from "std-widgets.slint";
 
-export struct TrackItem { id: int, title: string, artist: string, album: string, duration: string }
+export struct TrackItem { id: int, index: int, header: bool, title: string, artist: string, album: string, duration: string }
 export struct LyricLine { text: string, current: bool }
 export struct FolderItem { path: string, name: string, depth: int, count: int }
 
@@ -48,16 +48,76 @@ component Bar inherits Rectangle {
     }
 }
 
+// Divisor que se arrastra con el ratón. `sign` = -1 si el panel que cambia está a la derecha.
+component Splitter inherits Rectangle {
+    in-out property <length> value;
+    in property <length> min-value: 100px;
+    in property <length> max-value: 600px;
+    in property <float> sign: 1;
+    callback released();
+    width: 6px;
+    background: (ta.has-hover || ta.pressed) ? #3b82f666 : transparent;
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.col-resize;
+        moved => {
+            if (self.pressed) {
+                root.value = clamp(root.value + root.sign * (self.mouse-x - self.pressed-x), root.min-value, root.max-value);
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up) { root.released(); }
+        }
+    }
+}
+
+component HeaderCell inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    in property <bool> desc;
+    callback clicked();
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        spacing: 6px;
+        Text { text: root.label; color: root.active ? #ffffff : #9aa0a6; font-size: 12px; font-weight: 600; vertical-alignment: center; overflow: elide; }
+        if root.active: Rectangle {
+            width: 8px;
+            Path {
+                x: 0px;
+                y: (parent.height - 6px) / 2;
+                width: 8px;
+                height: 6px;
+                viewbox-width: 8;
+                viewbox-height: 6;
+                commands: root.desc ? "M 0 0 L 8 0 L 4 6 Z" : "M 0 6 L 4 0 L 8 6 Z";
+                fill: #8ab4ff;
+            }
+        }
+    }
+}
+
+component LyricRow inherits Text {
+    in property <bool> current;
+    callback became-current(length);
+    wrap: word-wrap;
+    color: root.current ? #ffffff : #6b7280;
+    font-size: root.current ? 18px : 15px;
+    font-weight: root.current ? 700 : 400;
+    changed current => {
+        if (self.current) { self.became-current(self.y); }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "Pulso";
-    preferred-width: 1180px;
-    preferred-height: 640px;
-    min-width: 920px;
+    preferred-width: 1280px;
+    preferred-height: 680px;
+    min-width: 900px;
     min-height: 480px;
     background: #0e1014;
 
     in property <[TrackItem]> tracks;
     in property <[LyricLine]> lyrics;
+    in property <[FolderItem]> folders;
     in property <string> lyrics-status;
     in property <int> current-id: -1;
     in property <string> now-title;
@@ -67,15 +127,42 @@ export component MainWindow inherits Window {
     in property <string> status-text;
     in property <float> progress;
     in property <bool> playing;
+    in property <int> underruns;
     in-out property <float> volume: 0.8;
-    in property <[FolderItem]> folders;
     in-out property <string> selected-folder: "";
+
+    // Diseño (se guarda entre sesiones)
+    in-out property <length> sidebar-w: 220px;
+    in-out property <length> lyrics-w: 340px;
+    in-out property <length> title-w: 260px;
+    in-out property <length> artist-w: 160px;
+    // Espacio útil para título + artista + álbum, y anchos efectivos: si el panel se estrecha,
+    // las columnas se encogen para que "Dur." y el lápiz nunca queden fuera.
+    property <length> center-w: 640px; // se actualiza desde el panel central (evita un bucle de diseño)
+    property <length> avail: max(200px, root.center-w - 32px - 148px);
+    property <length> eff-artist: min(root.artist-w, max(60px, root.avail * 0.4));
+    property <length> eff-title: min(root.title-w, max(80px, root.avail - root.eff-artist - 60px));
+    in-out property <string> sort-col: "";
+    in-out property <bool> sort-desc: false;
+    in-out property <bool> group-artist: false;
+    in-out property <int> audio-buffer: 8192;
+
+    // Editor de letra
     in-out property <bool> editing: false;
     in-out property <string> edit-text;
     in-out property <string> edit-artist;
     in-out property <string> edit-title;
     in property <string> edit-name;
     in property <string> edit-status;
+
+    // Editor de etiquetas y ajustes
+    in-out property <bool> tags-open: false;
+    in-out property <string> tags-title;
+    in-out property <string> tags-artist;
+    in-out property <string> tags-album;
+    in property <string> tags-path;
+    in property <string> tags-status;
+    in-out property <bool> settings-open: false;
 
     callback open-folder();
     callback play-track(int);
@@ -86,12 +173,27 @@ export component MainWindow inherits Window {
     callback volume-changed(float);
     callback search(string);
     callback folder-selected(string);
+    callback header-clicked(string);
+    callback toggle-group();
+    callback layout-changed();
     callback edit-lyrics();
     callback cancel-edit();
     callback save-lyrics(string);
     callback delete-lyrics();
     callback search-lyrics(string, string);
     callback web-lyrics(string, string);
+    callback edit-tags(int);
+    callback save-tags(string, string, string);
+    callback set-buffer(int);
+
+    // Desplaza la lista solo si la fila no se ve (la fila mide 40 px).
+    public function ensure-visible(row: int) {
+        if (row >= 0) {
+            if (row * 40px < -track-list.content-y || (row + 1) * 40px > -track-list.content-y + track-list.visible-height) {
+                track-list.content-y = clamp(-(row * 40px - track-list.visible-height / 2 + 20px), min(0px, track-list.visible-height - track-list.content-height), 0px);
+            }
+        }
+    }
 
     VerticalLayout {
         HorizontalLayout {
@@ -99,7 +201,7 @@ export component MainWindow inherits Window {
 
             // ---- Carpetas ----
             Rectangle {
-                width: 220px;
+                width: root.sidebar-w;
                 background: #0b0d11;
                 VerticalLayout {
                     padding: 12px;
@@ -123,12 +225,15 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+            Splitter { value <=> root.sidebar-w; min-value: 140px; max-value: 480px; released => { root.layout-changed(); } }
 
-            // ---- Biblioteca ----
+            // ---- Canciones ----
             VerticalLayout {
-                horizontal-stretch: 3;
+                horizontal-stretch: 1;
+                min-width: 380px;
                 padding: 16px;
-                spacing: 12px;
+                spacing: 10px;
+                changed width => { root.center-w = self.width; }
 
                 HorizontalLayout {
                     spacing: 10px;
@@ -155,6 +260,14 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
+                        width: 150px;
+                        height: 36px;
+                        border-radius: 8px;
+                        background: root.group-artist ? (grp-ta.has-hover ? #3b82f6 : #2f6fe0) : (grp-ta.has-hover ? #ffffff2e : #ffffff14);
+                        Text { text: "Agrupar por artista"; color: #ffffff; font-size: 12px; }
+                        grp-ta := TouchArea { clicked => { root.toggle-group(); } }
+                    }
+                    Rectangle {
                         width: 130px;
                         height: 36px;
                         border-radius: 8px;
@@ -164,30 +277,78 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                ListView {
+                // Cabecera de columnas: clic = ordenar; arrastrar el borde = ancho.
+                Rectangle {
+                    height: 28px;
+                    background: #12151b;
+                    border-radius: 6px;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 10px;
+                        HeaderCell { width: root.eff-title; label: "Título"; active: root.sort-col == "title"; desc: root.sort-desc; clicked => { root.header-clicked("title"); } }
+                        HeaderCell { width: root.eff-artist; label: "Artista"; active: root.sort-col == "artist"; desc: root.sort-desc; clicked => { root.header-clicked("artist"); } }
+                        HeaderCell { horizontal-stretch: 1; label: "Álbum"; active: root.sort-col == "album"; desc: root.sort-desc; clicked => { root.header-clicked("album"); } }
+                        HeaderCell { width: 56px; label: "Dur."; active: root.sort-col == "duration"; desc: root.sort-desc; clicked => { root.header-clicked("duration"); } }
+                        Rectangle { width: 28px; }
+                    }
+                    Splitter { x: 12px + root.eff-title + 2px; height: parent.height; value <=> root.title-w; min-value: 100px; max-value: max(100px, root.avail - root.eff-artist - 60px); released => { root.layout-changed(); } }
+                    Splitter { x: 12px + root.eff-title + 10px + root.eff-artist + 2px; height: parent.height; value <=> root.artist-w; min-value: 60px; max-value: max(60px, root.avail - root.eff-title - 60px); released => { root.layout-changed(); } }
+                }
+
+                track-list := ListView {
                     vertical-stretch: 1;
                     for t[i] in root.tracks: Rectangle {
-                        height: 44px;
-                        border-radius: 6px;
-                        background: t.id == root.current-id ? #22304a : (row-ta.has-hover ? #ffffff0d : transparent);
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            spacing: 12px;
-                            Text { text: t.title; color: #ffffff; font-size: 14px; overflow: elide; vertical-alignment: center; horizontal-stretch: 3; }
-                            Text { text: t.artist; color: #9aa0a6; font-size: 13px; overflow: elide; vertical-alignment: center; horizontal-stretch: 2; }
-                            Text { text: t.duration; color: #9aa0a6; font-size: 13px; width: 48px; horizontal-alignment: right; vertical-alignment: center; }
+                        height: 40px;
+                        if t.header: Rectangle {
+                            background: #151922;
+                            border-radius: 6px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                Text { text: t.title; color: #8ab4ff; font-size: 13px; font-weight: 700; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { text: t.artist; color: #6b7280; font-size: 12px; vertical-alignment: center; }
+                            }
                         }
-                        row-ta := TouchArea { double-clicked => { root.play-track(i); } }
+                        if !t.header: Rectangle {
+                            border-radius: 6px;
+                            background: t.id == root.current-id ? #22304a : (row-ta.has-hover ? #ffffff0d : transparent);
+                            row-ta := TouchArea { double-clicked => { root.play-track(t.index); } }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                Text { width: root.eff-title; text: t.title; color: #ffffff; font-size: 14px; overflow: elide; vertical-alignment: center; }
+                                Text { width: root.eff-artist; text: t.artist; color: #9aa0a6; font-size: 13px; overflow: elide; vertical-alignment: center; }
+                                Text { horizontal-stretch: 1; text: t.album; color: #9aa0a6; font-size: 13px; overflow: elide; vertical-alignment: center; }
+                                Text { width: 56px; text: t.duration; color: #9aa0a6; font-size: 13px; horizontal-alignment: right; vertical-alignment: center; }
+                                Rectangle {
+                                    width: 28px;
+                                    edit-ta := TouchArea { clicked => { root.edit-tags(t.index); } }
+                                    Path {
+                                        x: (parent.width - 12px) / 2;
+                                        y: (parent.height - 12px) / 2;
+                                        width: 12px;
+                                        height: 12px;
+                                        viewbox-width: 12;
+                                        viewbox-height: 12;
+                                        commands: "M 1 11 L 1 8 L 8 1 L 11 4 L 4 11 Z";
+                                        fill: edit-ta.has-hover ? #8ab4ff : #6b7280;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                Text { text: root.status-text; color: #6b7280; font-size: 12px; }
+                Text { text: root.status-text; color: #6b7280; font-size: 12px; overflow: elide; }
             }
+            Splitter { value <=> root.lyrics-w; sign: -1; min-value: 220px; max-value: 640px; released => { root.layout-changed(); } }
 
             // ---- Letra ----
             Rectangle {
-                width: 340px;
+                width: root.lyrics-w;
                 background: #12151b;
                 VerticalLayout {
                     padding: 16px;
@@ -199,16 +360,19 @@ export component MainWindow inherits Window {
                         if !root.editing && root.current-id >= 0: TextButton { label: "Eliminar"; width: 72px; clicked => { root.delete-lyrics(); } }
                     }
                     if !root.editing: Text { text: root.lyrics-status; color: #6b7280; font-size: 12px; wrap: word-wrap; visible: root.lyrics-status != ""; }
-                    if !root.editing: ListView {
+                    if !root.editing: lyr-scroll := ScrollView {
                         vertical-stretch: 1;
-                        for l in root.lyrics: Text {
-                            height: 32px;
-                            text: l.text;
-                            overflow: elide;
-                            vertical-alignment: center;
-                            color: l.current ? #ffffff : #6b7280;
-                            font-size: l.current ? 18px : 15px;
-                            font-weight: l.current ? 700 : 400;
+                        animate content-y { duration: 300ms; easing: ease-in-out; }
+                        lyr-col := VerticalLayout {
+                            width: lyr-scroll.visible-width;
+                            spacing: 8px;
+                            for l in root.lyrics: LyricRow {
+                                text: l.text;
+                                current: l.current;
+                                became-current(y) => {
+                                    lyr-scroll.content-y = clamp(-y + lyr-scroll.visible-height * 0.35, min(0px, lyr-scroll.visible-height - lyr-col.preferred-height), 0px);
+                                }
+                            }
                         }
                     }
                     if root.editing: VerticalLayout {
@@ -227,7 +391,7 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             spacing: 6px;
                             TextButton { label: "Guardar"; primary: true; clicked => { root.save-lyrics(root.edit-text); } }
-                            TextButton { label: "Cancelar"; clicked => { root.cancel-edit(); } }
+                            TextButton { label: "Cancelar"; clicked => { root.editing = false; } }
                         }
                     }
                 }
@@ -292,13 +456,84 @@ export component MainWindow inherits Window {
                 }
 
                 VerticalLayout {
-                    width: 140px;
+                    width: 170px;
                     alignment: center;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: root.underruns > 0 ? "cortes: \{root.underruns}" : ""; color: #f59e0b; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
+                        TextButton { label: "Ajustes"; width: 70px; height: 26px; clicked => { root.settings-open = true; } }
+                    }
                     HorizontalLayout {
                         spacing: 8px;
                         Text { text: "Vol"; color: #9aa0a6; font-size: 11px; vertical-alignment: center; }
                         Bar { horizontal-stretch: 1; value: root.volume; changed(v) => { root.volume = v; root.volume-changed(v); } }
                     }
+                }
+            }
+        }
+    }
+
+    // ---- Diálogo: editar etiquetas ----
+    if root.tags-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+        TouchArea { }
+        Rectangle {
+            width: 480px;
+            height: 340px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1d24;
+            border-radius: 10px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: "Editar etiquetas"; color: #ffffff; font-size: 16px; font-weight: 700; }
+                Text { text: root.tags-path; color: #6b7280; font-size: 11px; overflow: elide; }
+                LineEdit { placeholder-text: "Título"; text <=> root.tags-title; }
+                LineEdit { placeholder-text: "Artista"; text <=> root.tags-artist; }
+                LineEdit { placeholder-text: "Álbum"; text <=> root.tags-album; }
+                Text { text: root.tags-status; color: #f59e0b; font-size: 12px; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    TextButton { label: "Guardar en el archivo"; primary: true; clicked => { root.save-tags(root.tags-title, root.tags-artist, root.tags-album); } }
+                    TextButton { label: "Cancelar"; clicked => { root.tags-open = false; } }
+                }
+            }
+        }
+    }
+
+    // ---- Diálogo: ajustes de audio ----
+    if root.settings-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000b8;
+        TouchArea { }
+        Rectangle {
+            width: 520px;
+            height: 320px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a1d24;
+            border-radius: 10px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text { text: "Ajustes de audio"; color: #ffffff; font-size: 16px; font-weight: 700; }
+                Text { text: "Tamaño del búfer: si oyes cortes en el sonido, sube un nivel. Un búfer mayor aguanta mejor los tirones del equipo, pero la pausa y el volumen tardan un poco más en notarse. Se aplica desde la siguiente canción."; color: #9aa0a6; font-size: 12px; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    TextButton { label: "Pequeño"; primary: root.audio-buffer == 4096; clicked => { root.set-buffer(4096); } }
+                    TextButton { label: "Normal"; primary: root.audio-buffer == 8192; clicked => { root.set-buffer(8192); } }
+                    TextButton { label: "Grande"; primary: root.audio-buffer == 16384; clicked => { root.set-buffer(16384); } }
+                    TextButton { label: "Máximo"; primary: root.audio-buffer == 32768; clicked => { root.set-buffer(32768); } }
+                }
+                Text { text: "Búfer actual: \{root.audio-buffer} tramas (unos \{round(root.audio-buffer / 48.0)} ms a 48 kHz)"; color: #8ab4ff; font-size: 12px; }
+                Text { text: "Cortes de audio detectados en esta sesión: \{root.underruns}"; color: #8ab4ff; font-size: 12px; vertical-stretch: 1; }
+                HorizontalLayout {
+                    TextButton { label: "Cerrar"; width: 90px; clicked => { root.settings-open = false; } }
                 }
             }
         }

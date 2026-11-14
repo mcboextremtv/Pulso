@@ -6,6 +6,15 @@ Reproductor de música libre, rápido y liviano. Sin telemetría, sin publicidad
 - **Interfaz en Slint** (`crates/app`) con renderizador por software: no necesita GPU, drivers ni runtimes externos. Un solo `.exe`.
 - El audio abre el dispositivo solo al reproducir y corre en su propio hilo. La red solo se usa al pedir una letra.
 
+## Hito 1.3: tabla, paneles ajustables y etiquetas
+- **Paneles ajustables:** arrastra los divisores entre carpetas, canciones y letra; los tamaños se guardan (`%APPDATA%\Pulso\settings.txt`).
+- **Tabla con columnas alineadas:** Título, Artista, Álbum y Duración. Clic en una cabecera ordena ascendente, otro clic descendente, un tercero vuelve al orden de carpeta. Arrastra el borde de una cabecera para cambiar su ancho.
+- **Agrupar por artista** (botón sobre la tabla).
+- **Editar etiquetas:** el lápiz de cada fila escribe título, artista y álbum dentro del archivo. Si es la canción que suena, se suelta un instante y se retoma en el mismo punto.
+- **Lista que sigue a la canción:** al pasar a la siguiente pista (botón, o sola) la lista se desplaza hasta mostrarla; no se mueve si ya se ve ni mientras tú te desplazas.
+- **Letra con líneas largas ajustadas al ancho** y desplazamiento automático a la línea activa.
+- **Audio:** búfer de salida por defecto de 8192 tramas, cola de decodificación de 4 s y hilo de decodificación con prioridad algo mayor. En *Ajustes* puedes subir el búfer (Pequeño/Normal/Grande/Máximo); junto al botón aparece «cortes: N» si el decodificador no llegó a tiempo.
+
 ## Hito 1.2: carpetas y letras editables
 - **Panel de carpetas** (izquierda): árbol real de tu disco con contadores; al elegir una carpeta se ven sus canciones y las de sus subcarpetas. «Todas las canciones» quita el filtro. La búsqueda funciona sobre la carpeta elegida.
 - **Letras que tú controlas:** botones *Editar* y *Eliminar* sobre el panel de letra. En el editor puedes cambiar artista/título, pulsar *Buscar letra* (LRCLIB), *Buscar en la web* (abre tu navegador con la búsqueda; copias y pegas aquí), corregir el texto y *Guardar*. Con marcas `[mm:ss.xx]` se guarda como `.lrc` (sincronizada); sin marcas, como `.lyrics.txt`. Todo queda junto a la canción.

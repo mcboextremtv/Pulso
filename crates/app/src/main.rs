@@ -6,8 +6,9 @@ use pulso_core::{
     library::{Library, Track},
     lyrics, paths,
     player::{PlayState, Player},
+    settings::Settings,
 };
-use slint::{ComponentHandle, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -17,15 +18,23 @@ use std::{
 
 #[derive(Default)]
 struct State {
+    /// Pistas en el orden de la lista (sin las filas de grupo).
     view: Vec<Track>,
+    /// Fila de la interfaz que ocupa cada pista de `view` (hay filas extra con grupos).
+    ui_rows: Vec<usize>,
     query: String,
     /// Carpeta seleccionada (vacía = toda la biblioteca), sin separador final.
     folder: String,
+    sort_col: String,
+    sort_desc: bool,
+    group: bool,
     current: Option<Track>,
     /// Pista cuya letra se está editando (puede no ser la que suena).
     edit_track: Option<Track>,
+    /// Pista cuyas etiquetas se están editando.
+    tags_track: Option<Track>,
     synced: Vec<(Duration, String)>,
-    /// -2 = hay que redibujar, -1 = antes de la primera línea, n = línea activa
+    /// -2 = hay que redibujar, -1 = ninguna línea activa, n = línea activa
     last_lyric: i64,
     last_underruns: u64,
 }
@@ -46,47 +55,97 @@ fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
     ModelRc::new(VecModel::from(v))
 }
 
-fn lyric_window(lines: &[(Duration, String)], cur: i64) -> Vec<LyricLine> {
-    let (from, to) = if cur < 0 {
-        (0, lines.len().min(9))
-    } else {
-        let c = cur as usize;
-        (c.saturating_sub(3), (c + 6).min(lines.len()))
-    };
-    (from..to)
-        .map(|i| LyricLine { text: lines[i].1.clone().into(), current: i as i64 == cur })
-        .collect()
-}
-
 fn plain_lines(text: &str) -> Vec<LyricLine> {
     text.lines().map(|l| LyricLine { text: l.into(), current: false }).collect()
 }
 
-/// Recarga la lista de canciones (según búsqueda y carpeta) en segundo plano.
+fn save_settings(ui: &MainWindow) {
+    let s = Settings {
+        sidebar_w: ui.get_sidebar_w(),
+        lyrics_w: ui.get_lyrics_w(),
+        title_w: ui.get_title_w(),
+        artist_w: ui.get_artist_w(),
+        sort_col: ui.get_sort_col().to_string(),
+        sort_desc: ui.get_sort_desc(),
+        group_artist: ui.get_group_artist(),
+        audio_buffer: ui.get_audio_buffer().max(1024) as u32,
+    };
+    let _ = s.save();
+}
+
+// ---------------------------------------------------------------------------
+// Lista de canciones
+// ---------------------------------------------------------------------------
+
+fn track_item(t: &Track, index: usize) -> TrackItem {
+    TrackItem {
+        id: t.id as i32,
+        index: index as i32,
+        header: false,
+        title: t.title.clone().into(),
+        artist: t.artist.clone().into(),
+        album: t.album.clone().into(),
+        duration: fmt_time(Duration::from_millis(t.duration_ms)).into(),
+    }
+}
+
+/// Filas de la interfaz. Con `group`, antes de cada artista va una fila de encabezado.
+/// Devuelve también la fila que ocupa cada pista.
+fn build_rows(view: &[Track], group: bool) -> (Vec<TrackItem>, Vec<usize>) {
+    let mut items = Vec::with_capacity(view.len() + 16);
+    let mut rows = Vec::with_capacity(view.len());
+    let mut i = 0;
+    while i < view.len() {
+        if group {
+            let key = view[i].artist.to_lowercase();
+            let mut j = i;
+            while j < view.len() && view[j].artist.to_lowercase() == key {
+                j += 1;
+            }
+            let name = if view[i].artist.is_empty() { "Sin artista".to_string() } else { view[i].artist.clone() };
+            items.push(TrackItem {
+                id: -1,
+                index: -1,
+                header: true,
+                title: name.into(),
+                artist: format!("{} canciones", j - i).into(),
+                album: "".into(),
+                duration: "".into(),
+            });
+            for k in i..j {
+                rows.push(items.len());
+                items.push(track_item(&view[k], k));
+            }
+            i = j;
+        } else {
+            rows.push(items.len());
+            items.push(track_item(&view[i], i));
+            i += 1;
+        }
+    }
+    (items, rows)
+}
+
+/// Recarga la lista (búsqueda, carpeta, orden y agrupación) en segundo plano.
 fn refresh_view(ui: Weak<MainWindow>, st: Shared) {
     thread::spawn(move || {
-        let (query, folder) = {
+        let (query, folder, col, desc, group) = {
             let g = st.lock().unwrap();
-            (g.query.clone(), g.folder.clone())
+            (g.query.clone(), g.folder.clone(), g.sort_col.clone(), g.sort_desc, g.group)
         };
         let prefix = if folder.is_empty() { String::new() } else { format!("{folder}{}", std::path::MAIN_SEPARATOR) };
         let tracks = Library::open(&paths::db_path())
-            .and_then(|lib| lib.search_in(&query, &prefix, 100_000))
+            .and_then(|lib| lib.search_sorted(&query, &prefix, &col, desc, group, 100_000))
             .unwrap_or_default();
         let st2 = st.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| {
-            let items: Vec<TrackItem> = tracks
-                .iter()
-                .map(|t| TrackItem {
-                    id: t.id as i32,
-                    title: t.title.clone().into(),
-                    artist: t.artist.clone().into(),
-                    album: t.album.clone().into(),
-                    duration: fmt_time(Duration::from_millis(t.duration_ms)).into(),
-                })
-                .collect();
-            let n = items.len();
-            st2.lock().unwrap().view = tracks;
+            let (items, rows) = build_rows(&tracks, group);
+            let n = tracks.len();
+            {
+                let mut g = st2.lock().unwrap();
+                g.view = tracks;
+                g.ui_rows = rows;
+            }
             ui.set_tracks(model(items));
             if n == 0 && ui.get_status_text().is_empty() {
                 ui.set_status_text("No hay canciones aquí: usa «Agregar carpeta».".into());
@@ -157,13 +216,13 @@ fn names_for(t: &Track) -> (String, String) {
     }
 }
 
-/// Muestra `text` como letra de la pista actual (sincronizada o plana) y devuelve el aviso.
+/// Muestra `text` como letra de la pista actual (sincronizada o plana).
 fn apply_lyrics_text(ui: &MainWindow, st: &Shared, text: &str) {
     let synced = lyrics::parse_lrc(text);
     let mut g = st.lock().unwrap();
     if !synced.is_empty() {
         g.synced = synced;
-        g.last_lyric = -2; // el temporizador la dibuja en el siguiente ciclo
+        g.last_lyric = -2; // el temporizador reconstruye las líneas en el siguiente ciclo
         ui.set_lyrics_status("".into());
     } else {
         g.synced.clear();
@@ -178,7 +237,6 @@ fn apply_lyrics_text(ui: &MainWindow, st: &Shared, text: &str) {
 }
 
 /// Letra local (editable por el usuario) o, si no hay, intento automático con LRCLIB.
-/// Devuelve el texto a mostrar o un aviso.
 fn load_lyrics(t: &Track) -> Result<String, String> {
     let path = PathBuf::from(&t.path);
     if let Some(text) = lyrics::load_local(&path) {
@@ -212,15 +270,38 @@ fn open_url(url: &str) {
     let _ = Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Marca la línea activa sin reconstruir el modelo (la vista se desplaza sola hasta ella).
+fn update_lyric_highlight(ui: &MainWindow, g: &mut State, idx: i64) {
+    let m = ui.get_lyrics();
+    if g.last_lyric == -2 || m.row_count() != g.synced.len() {
+        ui.set_lyrics(model(
+            g.synced.iter().map(|(_, t)| LyricLine { text: t.clone().into(), current: false }).collect(),
+        ));
+        g.last_lyric = -1; // la línea activa se marca en el siguiente ciclo, ya con las filas creadas
+        return;
+    }
+    let set = |row: i64, current: bool| {
+        if row >= 0 {
+            if let Some(mut r) = m.row_data(row as usize) {
+                r.current = current;
+                m.set_row_data(row as usize, r);
+            }
+        }
+    };
+    set(g.last_lyric, false);
+    set(idx, true);
+    g.last_lyric = idx;
+}
+
 // ---------------------------------------------------------------------------
 // Reproducción
 // ---------------------------------------------------------------------------
 
 fn play_at(ui: &MainWindow, st: &Shared, player: &PlayerRef, idx: usize) {
-    let track = {
+    let (track, ui_row) = {
         let g = st.lock().unwrap();
         match g.view.get(idx) {
-            Some(t) => t.clone(),
+            Some(t) => (t.clone(), g.ui_rows.get(idx).copied()),
             None => return,
         }
     };
@@ -241,6 +322,9 @@ fn play_at(ui: &MainWindow, st: &Shared, player: &PlayerRef, idx: usize) {
     ui.set_status_text("".into());
     ui.set_lyrics(model(vec![]));
     ui.set_lyrics_status("Buscando letra…".into());
+    if let Some(row) = ui_row {
+        ui.invoke_ensure_visible(row as i32); // solo se desplaza si la fila no se ve
+    }
 
     let st = st.clone();
     let weak = ui.as_weak();
@@ -311,9 +395,27 @@ fn main() {
     };
     let bench = std::env::var_os("PULSO_BENCH").is_some();
     let player: PlayerRef = Arc::new(Player::new());
-    let st: Shared = Arc::new(Mutex::new(State { last_lyric: -2, ..Default::default() }));
 
+    // Ajustes guardados: tamaños de paneles y columnas, orden, agrupación y búfer de audio.
+    let cfg = Settings::load();
+    ui.set_sidebar_w(cfg.sidebar_w);
+    ui.set_lyrics_w(cfg.lyrics_w);
+    ui.set_title_w(cfg.title_w);
+    ui.set_artist_w(cfg.artist_w);
+    ui.set_sort_col(cfg.sort_col.clone().into());
+    ui.set_sort_desc(cfg.sort_desc);
+    ui.set_group_artist(cfg.group_artist);
+    ui.set_audio_buffer(cfg.audio_buffer as i32);
+    player.set_buffer(cfg.audio_buffer);
     player.set_volume(0.8);
+
+    let st: Shared = Arc::new(Mutex::new(State {
+        last_lyric: -2,
+        sort_col: cfg.sort_col,
+        sort_desc: cfg.sort_desc,
+        group: cfg.group_artist,
+        ..Default::default()
+    }));
 
     ui.on_open_folder({
         let (w, st) = (ui.as_weak(), st.clone());
@@ -340,11 +442,65 @@ fn main() {
             refresh_view(w.clone(), st.clone());
         }
     });
+    // Clic en una cabecera: ascendente → descendente → orden de carpeta.
+    ui.on_header_clicked({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |col| {
+            let Some(ui) = w.upgrade() else { return };
+            {
+                let mut g = st.lock().unwrap();
+                if g.sort_col != col.as_str() {
+                    g.sort_col = col.to_string();
+                    g.sort_desc = false;
+                } else if !g.sort_desc {
+                    g.sort_desc = true;
+                } else {
+                    g.sort_col.clear();
+                    g.sort_desc = false;
+                }
+                ui.set_sort_col(g.sort_col.clone().into());
+                ui.set_sort_desc(g.sort_desc);
+            }
+            save_settings(&ui);
+            refresh_view(w.clone(), st.clone());
+        }
+    });
+    ui.on_toggle_group({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move || {
+            let Some(ui) = w.upgrade() else { return };
+            let group = {
+                let mut g = st.lock().unwrap();
+                g.group = !g.group;
+                g.group
+            };
+            ui.set_group_artist(group);
+            save_settings(&ui);
+            refresh_view(w.clone(), st.clone());
+        }
+    });
+    ui.on_layout_changed({
+        let w = ui.as_weak();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                save_settings(&ui);
+            }
+        }
+    });
+    ui.on_set_buffer({
+        let (w, p) = (ui.as_weak(), player.clone());
+        move |n| {
+            let Some(ui) = w.upgrade() else { return };
+            ui.set_audio_buffer(n);
+            p.set_buffer(n.max(1024) as u32);
+            save_settings(&ui);
+        }
+    });
     ui.on_play_track({
         let (w, st, p) = (ui.as_weak(), st.clone(), player.clone());
         move |i| {
             if let Some(ui) = w.upgrade() {
-                play_at(&ui, &st, &p, i as usize);
+                play_at(&ui, &st, &p, i.max(0) as usize);
             }
         }
     });
@@ -419,14 +575,6 @@ fn main() {
             st.lock().unwrap().edit_track = Some(tr);
         }
     });
-    ui.on_cancel_edit({
-        let w = ui.as_weak();
-        move || {
-            if let Some(ui) = w.upgrade() {
-                ui.set_editing(false);
-            }
-        }
-    });
     ui.on_search_lyrics({
         let (w, st) = (ui.as_weak(), st.clone());
         move |artist, title| {
@@ -484,6 +632,69 @@ fn main() {
         }
     });
 
+    // ---- Editor de etiquetas ----
+    ui.on_edit_tags({
+        let (w, st) = (ui.as_weak(), st.clone());
+        move |index| {
+            let Some(ui) = w.upgrade() else { return };
+            let Some(tr) = st.lock().unwrap().view.get(index.max(0) as usize).cloned() else { return };
+            ui.set_tags_title(tr.title.clone().into());
+            ui.set_tags_artist(tr.artist.clone().into());
+            ui.set_tags_album(tr.album.clone().into());
+            ui.set_tags_path(tr.path.clone().into());
+            ui.set_tags_status("Los cambios se escriben dentro del archivo de música.".into());
+            ui.set_tags_open(true);
+            st.lock().unwrap().tags_track = Some(tr);
+        }
+    });
+    ui.on_save_tags({
+        let (w, st, p) = (ui.as_weak(), st.clone(), player.clone());
+        move |title, artist, album| {
+            let Some(tr) = st.lock().unwrap().tags_track.clone() else { return };
+            if let Some(ui) = w.upgrade() {
+                ui.set_tags_status("Guardando…".into());
+            }
+            let (title, artist, album) = (title.to_string(), artist.to_string(), album.to_string());
+            let (weak, st, p) = (w.clone(), st.clone(), p.clone());
+            thread::spawn(move || {
+                // Windows no deja escribir un archivo abierto: si es el que suena, se suelta un
+                // instante y se retoma en el mismo punto.
+                let is_current = cur_id(&st.lock().unwrap()) == Some(tr.id);
+                let before = p.status();
+                if is_current {
+                    p.stop();
+                    thread::sleep(Duration::from_millis(300));
+                }
+                let result = Library::open(&paths::db_path())
+                    .and_then(|lib| lib.apply_tags(tr.id, Path::new(&tr.path), &title, &artist, &album));
+                if is_current {
+                    p.play(&tr.path);
+                    p.seek(before.position);
+                    if before.state == PlayState::Paused {
+                        p.pause();
+                    }
+                }
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(()) => {
+                        ui.set_tags_open(false);
+                        if is_current {
+                            let mut g = st.lock().unwrap();
+                            if let Some(c) = g.current.as_mut() {
+                                c.title = if title.trim().is_empty() { c.title.clone() } else { title.trim().to_string() };
+                                c.artist = artist.trim().to_string();
+                                c.album = album.trim().to_string();
+                                ui.set_now_title(c.title.clone().into());
+                                ui.set_now_artist(c.artist.clone().into());
+                            }
+                        }
+                        refresh_view(ui.as_weak(), st.clone());
+                    }
+                    Err(e) => ui.set_tags_status(format!("No se pudo guardar: {e}").into()),
+                });
+            });
+        }
+    });
+
     // Un solo temporizador de 250 ms: posición, barra de progreso, letra y paso a la siguiente pista.
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(250), {
@@ -496,9 +707,12 @@ fn main() {
                 if let Some(e) = &s.error {
                     ui.set_status_text(e.clone().into());
                 }
-                if bench && s.underruns != g.last_underruns {
+                if s.underruns != g.last_underruns {
                     g.last_underruns = s.underruns;
-                    eprintln!("[bench] cortes de audio acumulados: {}", s.underruns);
+                    ui.set_underruns(s.underruns as i32);
+                    if bench {
+                        eprintln!("[bench] cortes de audio acumulados: {}", s.underruns);
+                    }
                 }
                 if let Some(cur) = g.current.clone() {
                     ui.set_playing(s.state == PlayState::Playing);
@@ -512,8 +726,7 @@ fn main() {
                     if !g.synced.is_empty() {
                         let idx = lyrics::current_line(&g.synced, s.position).map(|i| i as i64).unwrap_or(-1);
                         if idx != g.last_lyric {
-                            g.last_lyric = idx;
-                            ui.set_lyrics(model(lyric_window(&g.synced, idx)));
+                            update_lyric_highlight(&ui, &mut g, idx);
                         }
                     }
                 }

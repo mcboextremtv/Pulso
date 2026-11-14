@@ -1,6 +1,6 @@
 //! Biblioteca en SQLite con escaneo incremental (solo relee archivos modificados).
 use crate::Result;
-use lofty::{prelude::*, probe::Probe};
+use lofty::{config::WriteOptions, prelude::*, probe::Probe, tag::Tag};
 use rusqlite::{params, Connection};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -47,6 +47,22 @@ pub fn read_tags(path: &Path) -> Result<Track> {
         album: tag.and_then(|t| get(t.album())).unwrap_or_default(),
         duration_ms: tagged.properties().duration().as_millis() as u64,
     })
+}
+
+/// Escribe las etiquetas básicas en el archivo (crea la etiqueta si no tenía ninguna).
+pub fn write_tags(path: &Path, title: &str, artist: &str, album: &str) -> Result<()> {
+    let mut tagged = Probe::open(path)?.read()?;
+    if tagged.primary_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged.primary_tag_mut().ok_or("este formato no admite etiquetas")?;
+    let (title, artist, album) = (title.trim(), artist.trim(), album.trim());
+    if title.is_empty() { tag.remove_title() } else { tag.set_title(title.to_string()) }
+    if artist.is_empty() { tag.remove_artist() } else { tag.set_artist(artist.to_string()) }
+    if album.is_empty() { tag.remove_album() } else { tag.set_album(album.to_string()) }
+    tagged.save_to_path(path, WriteOptions::default())?;
+    Ok(())
 }
 
 /// Carpeta de la vista en árbol (aplanada, con sangría por `depth`).
@@ -155,14 +171,43 @@ impl Library {
     /// Igual que `search`, limitado a una carpeta (y sus subcarpetas).
     /// `folder_prefix` debe terminar en el separador de rutas; vacío = sin límite.
     pub fn search_in(&self, query: &str, folder_prefix: &str, limit: usize) -> Result<Vec<Track>> {
-        let like = format!("%{}%", query.trim());
-        let mut stmt = self.conn.prepare(
+        self.search_sorted(query, folder_prefix, "", false, false, limit)
+    }
+
+    /// Búsqueda con orden. `sort_col`: "title", "artist", "album", "duration" o "" (orden de
+    /// carpeta). Con `group_by_artist` las pistas salen agrupadas por artista.
+    pub fn search_sorted(
+        &self,
+        query: &str,
+        folder_prefix: &str,
+        sort_col: &str,
+        desc: bool,
+        group_by_artist: bool,
+        limit: usize,
+    ) -> Result<Vec<Track>> {
+        // Lista cerrada: el nombre de columna nunca viene del usuario tal cual.
+        let col = match sort_col {
+            "title" => "title COLLATE NOCASE",
+            "artist" => "artist COLLATE NOCASE",
+            "album" => "album COLLATE NOCASE",
+            "duration" => "duration_ms",
+            _ => "path COLLATE NOCASE",
+        };
+        let dir = if desc { "DESC" } else { "ASC" };
+        let order = if group_by_artist {
+            format!("artist COLLATE NOCASE ASC, {col} {dir}, path COLLATE NOCASE")
+        } else {
+            format!("{col} {dir}, path COLLATE NOCASE")
+        };
+        let sql = format!(
             "SELECT id, path, title, artist, album, duration_ms FROM tracks
              WHERE (title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1)
                AND (?3 = '' OR substr(path, 1, length(?3)) = ?3)
-             ORDER BY path COLLATE NOCASE
-             LIMIT ?2",
-        )?;
+             ORDER BY {order}
+             LIMIT ?2"
+        );
+        let like = format!("%{}%", query.trim());
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![like, limit as i64, folder_prefix], |r| {
             Ok(Track {
                 id: r.get(0)?,
@@ -174,6 +219,25 @@ impl Library {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Escribe título, artista y álbum en el archivo y actualiza la biblioteca.
+    /// Un campo vacío se borra de la etiqueta (el título vacío vuelve al nombre del archivo).
+    pub fn apply_tags(&self, id: i64, path: &Path, title: &str, artist: &str, album: &str) -> Result<()> {
+        write_tags(path, title, artist, album)?;
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let title = if title.trim().is_empty() { stem } else { title.trim().to_string() };
+        let mtime = fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "UPDATE tracks SET title = ?2, artist = ?3, album = ?4, mtime = ?5 WHERE id = ?1",
+            params![id, title, artist.trim(), album.trim(), mtime],
+        )?;
+        Ok(())
     }
 
     /// Árbol de carpetas de la biblioteca, aplanado y ordenado. Empieza debajo de la
@@ -335,5 +399,35 @@ mod tests {
         let under_rock = lib.search_in("", &format!("{}{sep}", rock.path), 100).unwrap();
         assert_eq!(under_rock.len(), 2);
         assert_eq!(lib.search_in("t2", "", 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sorts_groups_and_edits_tags() {
+        let dir = std::env::temp_dir().join(format!("pulso-tags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["b.wav", "a.wav", "c.wav"] {
+            fs::write(dir.join(n), silent_wav(1)).unwrap();
+        }
+        let mut lib = Library::open_in_memory().unwrap();
+        lib.scan(&dir, |_| {}).unwrap();
+
+        let titles = |v: Vec<Track>| v.into_iter().map(|t| t.title).collect::<Vec<_>>();
+        assert_eq!(titles(lib.search_sorted("", "", "title", false, false, 10).unwrap()), ["a", "b", "c"]);
+        assert_eq!(titles(lib.search_sorted("", "", "title", true, false, 10).unwrap()), ["c", "b", "a"]);
+
+        let a = lib.search("a", 10).unwrap().into_iter().find(|t| t.title == "a").unwrap();
+        lib.apply_tags(a.id, Path::new(&a.path), "Mi canción", "Zeta", "Mi álbum").unwrap();
+        let again = lib.search("Mi canción", 10).unwrap();
+        assert_eq!((again[0].artist.as_str(), again[0].album.as_str()), ("Zeta", "Mi álbum"));
+        let from_file = read_tags(Path::new(&a.path)).unwrap();
+        assert_eq!((from_file.title.as_str(), from_file.artist.as_str()), ("Mi canción", "Zeta"));
+
+        // Agrupado por artista: los sin artista primero, "Zeta" al final.
+        let g = lib.search_sorted("", "", "", false, true, 10).unwrap();
+        assert_eq!(g.last().unwrap().artist, "Zeta");
+        // Tras editar, un nuevo escaneo no debe tratarlo como cambiado.
+        assert_eq!(lib.scan(&dir, |_| {}).unwrap().unchanged, 3);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

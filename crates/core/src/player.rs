@@ -42,6 +42,7 @@ enum Cmd {
     Resume,
     Stop,
     Volume(f32),
+    SetBuffer(u32),
     Seek(Duration),
     Quit,
 }
@@ -81,6 +82,10 @@ impl Player {
     pub fn stop(&self) {
         let _ = self.tx.send(Cmd::Stop);
     }
+    /// Tamaño del búfer de salida (tramas). Se aplica desde la siguiente canción.
+    pub fn set_buffer(&self, frames: u32) {
+        let _ = self.tx.send(Cmd::SetBuffer(frames));
+    }
     pub fn set_volume(&self, v: f32) {
         let _ = self.tx.send(Cmd::Volume(v.clamp(0.0, 1.0)));
     }
@@ -111,8 +116,10 @@ impl Drop for Player {
 // ---------------------------------------------------------------------------
 
 const CHUNK: usize = 8192; // muestras por bloque
-const BUFFER_SECS: usize = 2;
-const PREFILL_CHUNKS: usize = 4;
+const BUFFER_SECS: usize = 4;
+const PREFILL_CHUNKS: usize = 6;
+/// Búfer de salida por defecto (tramas). A 48 kHz son ~170 ms.
+pub const DEFAULT_BUFFER_FRAMES: u32 = 8192;
 
 struct Chunk {
     gen: u64,
@@ -193,6 +200,22 @@ impl Source for BufferedSource {
     }
 }
 
+/// Sube un poco la prioridad del hilo que decodifica: bajo carga del sistema,
+/// el audio es lo último que debe quedarse sin CPU.
+#[cfg(windows)]
+fn boost_current_thread() {
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+    }
+    // THREAD_PRIORITY_ABOVE_NORMAL = 1
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), 1);
+    }
+}
+#[cfg(not(windows))]
+fn boost_current_thread() {}
+
 fn decode_loop(
     mut dec: Decoder<BufReader<File>>,
     tx: mpsc::SyncSender<Chunk>,
@@ -201,6 +224,7 @@ fn decode_loop(
     queued: Arc<AtomicUsize>,
     finished: Arc<AtomicBool>,
 ) {
+    boost_current_thread();
     let mut my_gen = gen.load(Relaxed);
     'outer: loop {
         loop {
@@ -241,12 +265,12 @@ fn decode_loop(
     finished.store(true, Relaxed);
 }
 
-fn buffer_frames() -> BufferSize {
-    // PULSO_AUDIO_BUFFER=<frames> para probar; 0 = el de Windows por defecto.
+fn buffer_size(frames: u32) -> BufferSize {
+    // PULSO_AUDIO_BUFFER=<tramas> tiene prioridad (pruebas); 0 = el de Windows por defecto.
     let n = std::env::var("PULSO_AUDIO_BUFFER")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(4096);
+        .unwrap_or(frames);
     if n == 0 {
         BufferSize::Default
     } else {
@@ -256,19 +280,20 @@ fn buffer_frames() -> BufferSize {
 
 struct Open {
     stream: OutputStream,
+    frames: u32,
 }
 
 type Out = Option<Open>;
 
-fn open_output() -> Result<Open, String> {
+fn open_output(frames: u32) -> Result<Open, String> {
     let builder = OutputStreamBuilder::from_default_device()
         .map_err(|e| format!("Sin dispositivo de audio: {e}"))?
-        .with_buffer_size(buffer_frames());
+        .with_buffer_size(buffer_size(frames));
     let mut stream = builder
         .open_stream_or_fallback()
         .map_err(|e| format!("No se pudo abrir el audio: {e}"))?;
     stream.log_on_drop(false);
-    Ok(Open { stream })
+    Ok(Open { stream, frames })
 }
 
 struct Started {
@@ -277,9 +302,10 @@ struct Started {
     underruns: Arc<AtomicU64>,
 }
 
-fn start(path: &Path, out: &mut Out, volume: f32) -> Result<Started, String> {
-    if out.is_none() {
-        *out = Some(open_output()?);
+fn start(path: &Path, out: &mut Out, volume: f32, frames: u32) -> Result<Started, String> {
+    if out.as_ref().map(|o| o.frames) != Some(frames) {
+        *out = None; // cierra el dispositivo anterior antes de abrir con otro búfer
+        *out = Some(open_output(frames)?);
     }
     let file = File::open(path).map_err(|e| format!("No se pudo abrir el archivo: {e}"))?;
     let dec = Decoder::try_from(file).map_err(|e| format!("Formato no compatible: {e}"))?;
@@ -335,6 +361,7 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
     let mut sink: Option<Sink> = None;
     let mut underruns: Option<Arc<AtomicU64>> = None;
     let mut volume = 1.0_f32;
+    let mut frames = DEFAULT_BUFFER_FRAMES;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -342,7 +369,7 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
             Ok(Cmd::Play(path)) => {
                 sink = None; // detiene la anterior
                 underruns = None;
-                let result = start(&path, &mut out, volume);
+                let result = start(&path, &mut out, volume, frames);
                 let mut g = st.lock().unwrap();
                 match result {
                     Ok(s) => {
@@ -385,6 +412,7 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>, st: Arc<Mutex<Status>>) {
                 underruns = None;
                 *st.lock().unwrap() = Status::default();
             }
+            Ok(Cmd::SetBuffer(n)) => frames = n,
             Ok(Cmd::Volume(v)) => {
                 volume = v;
                 if let Some(s) = &sink {
